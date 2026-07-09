@@ -13,12 +13,15 @@ function onOpen() {
     .addItem("Setup Sheets", "setupSheetStructure")
     .addItem("Upgrade to Dual Accounts", "upgradeToDualAccount")
     .addItem("Apply Column Dropdowns", "applyLeadDropdownValidations")
+    .addItem("Highlight Required Columns", "applyHeaderFormattingMenu")
     .addSeparator()
     .addSubMenu(ui.createMenu("Ingest Leads")
       .addItem("Apollo Ingest (Sync Saved)", "runLeadIngestionPipeline")
       .addItem("LinkedIn X-Ray Ingest (Google CSE)", "runLinkedInXRayIngestionPipeline")
       .addItem("GitHub Search Ingest", "runGitHubIngestionPipeline")
       .addItem("Google Maps Ingest", "runGoogleMapsIngestionPipeline")
+      .addSeparator()
+      .addItem("Manual Apollo Enrichment (Selected)", "enrichSelectedRows")
     )
     .addSeparator()
     .addItem("Score new leads", "runScoringOnlyMenu")
@@ -30,11 +33,17 @@ function onOpen() {
     .addItem("Generate drafts for selected rows", "generateSelectedDrafts")
     .addItem("Send all generated drafts", "sendDraftsFromPipeline")
     .addItem("Scan replies & send follow-ups", "detectRepliesAndFollowUp")
+    .addItem("Preview follow-up (selected rows)", "previewFollowUpSelected")
+    .addItem("Send follow-up (selected rows)", "sendFollowUpForSelected")
+    .addItem("Send follow-up (all eligible)", "sendFollowUpForAll")
     .addSeparator()
     .addSubMenu(ui.createMenu("Automation Triggers")
       .addItem("Start Hourly Sending", "setupOutreachTrigger")
       .addItem("Stop Sending", "deactivateOutreachTrigger")
       .addItem("Send Now (Manual)", "runOutreachPipelineManualBatch")
+      .addSeparator()
+      .addItem("Start Daily Follow-ups", "setupFollowUpTrigger")
+      .addItem("Stop Follow-ups", "deactivateFollowUpTrigger")
     )
     .addSeparator()
     .addSubMenu(ui.createMenu("Assign Send Account")
@@ -158,6 +167,26 @@ function logRun(processedCount, scoredCount, flaggedCount, errors) {
 }
 
 /**
+ * Helper to check if the lead is in the recruitment industry.
+ * Feature 4: Recruitment industry hard filter.
+ */
+function isRecruitmentIndustry(industryText, config) {
+  if (!industryText || typeof industryText !== "string") return false;
+  
+  var keywords = (config["Recruitment Industry Keywords"] || "").split(",");
+  if (keywords.length === 0 || (keywords.length === 1 && keywords[0] === "")) return false;
+  
+  var textLower = industryText.toLowerCase();
+  for (var i = 0; i < keywords.length; i++) {
+    var kw = keywords[i].toString().trim().toLowerCase();
+    if (kw && textLower.indexOf(kw) !== -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Manual menu action to only run lead scoring (Step 2).
  */
 function runScoringOnlyMenu() {
@@ -175,6 +204,7 @@ function runScoringOnlyMenu() {
     return;
   }
   var headersMap = getHeadersMap(leadsSheet);
+  var mapping = resolveColumnMapping(leadsSheet, true);
   
   if (!validateHeadersPresent(ui, headersMap, ["Company", "Annual Revenue", "Total Funding", "Latest Funding", "Latest Funding Amount", "Last Raised At", "Score", "Score Reason", "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage"])) {
     return;
@@ -202,6 +232,24 @@ function runScoringOnlyMenu() {
       break;
     }
     
+    // Check Pipeline Stage first
+    var pipelineStageRange = leadsSheet.getRange(r, headersMap["Pipeline Stage"]);
+    var pipelineStage = pipelineStageRange.getValue().toString().trim();
+    if (pipelineStage.indexOf("Disqualified") !== -1) {
+      continue;
+    }
+    
+    // Feature 4: Recruitment Filter Gate
+    var industryText = getCanonical(leadsSheet, r, mapping, "industry");
+    if (isRecruitmentIndustry(industryText, config)) {
+      pipelineStageRange.setValue("Disqualified — Recruitment Industry");
+      if (headersMap["Outreach Status"]) leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Disqualified");
+      continue;
+    }
+    
+    // Feature 1: Flag rows with no resolvable email before wasting API credits
+    if (flagIfMissingEmail(leadsSheet, r, mapping, headersMap)) continue;
+    
     // Ensure company is validated first
     var companyValStatus = leadsSheet.getRange(r, headersMap["Company Validation Status"]).getValue().toString().trim();
     if (companyValStatus === "") {
@@ -210,7 +258,7 @@ function runScoringOnlyMenu() {
       if (headersMap["Company Validation Reason"] && valResult.reason) {
         leadsSheet.getRange(r, headersMap["Company Validation Reason"]).setValue(valResult.reason);
       }
-      leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue(companyValStatus === "Verified" ? "Company Verified" : "Needs Review");
+      pipelineStageRange.setValue(companyValStatus === "Verified" ? "Company Verified" : "Needs Review");
     }
     
     if (companyValStatus !== "Verified") {
@@ -220,15 +268,31 @@ function runScoringOnlyMenu() {
     
     var existingScore = leadsSheet.getRange(r, headersMap["Score"]).getValue().toString().trim();
     var existingReason = leadsSheet.getRange(r, headersMap["Score Reason"]).getValue().toString().trim();
-    var isScoreEmptyOrError = (existingScore === "" || existingScore.indexOf("Error") !== -1 || isNaN(existingScore));
+    
+    // Feature 3: A valid numeric score (1-10) is treated as a manual override — skip AI entirely.
+    var scoreAsNum = parseFloat(existingScore);
+    var isValidManualScore = (!isNaN(scoreAsNum) && scoreAsNum >= 1 && scoreAsNum <= 10 &&
+                              existingScore.indexOf("Error") === -1);
+    var isScoreEmptyOrError = (existingScore === "" || existingScore.indexOf("Error") !== -1 || isNaN(scoreAsNum));
     var isReasonEmptyOrError = (existingReason === "" || existingReason.indexOf("Error") !== -1);
     
-    if (isScoreEmptyOrError || isReasonEmptyOrError) {
+    if (isValidManualScore) {
+      // Manual score path: ensure Score Source and Reason are stamped
+      var scoreSourceRange = headersMap["Score Source"] ? leadsSheet.getRange(r, headersMap["Score Source"]) : null;
+      if (scoreSourceRange && scoreSourceRange.getValue().toString().trim() === "") {
+        scoreSourceRange.setValue("Manual");
+      }
+      if (existingReason === "") {
+        leadsSheet.getRange(r, headersMap["Score Reason"]).setValue("Manual Override");
+      }
+      pipelineStageRange.setValue("Scored");
+    } else if (isScoreEmptyOrError || isReasonEmptyOrError) {
       processed++;
-      var result = scoreSingleLead(leadsSheet, r, headersMap, config);
+      var result = scoreSingleLead(leadsSheet, r, headersMap, config, mapping);
       if (result.success) {
         scored++;
-        leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue("Scored");
+        pipelineStageRange.setValue("Scored");
+        if (headersMap["Score Source"]) leadsSheet.getRange(r, headersMap["Score Source"]).setValue("AI");
       } else {
         errors.push("Row " + r + ": " + result.error);
       }
@@ -272,6 +336,7 @@ function runFullPipelineMenu() {
     return;
   }
   var headersMap = getHeadersMap(leadsSheet);
+  var mapping = resolveColumnMapping(leadsSheet, true);
   
   // Verify all required headers exist
   var requiredHeaders = [
@@ -311,6 +376,23 @@ function runFullPipelineMenu() {
       break;
     }
     
+    var pipelineStageRange = leadsSheet.getRange(r, headersMap["Pipeline Stage"]);
+    var pipelineStage = pipelineStageRange.getValue().toString().trim();
+    if (pipelineStage.indexOf("Disqualified") !== -1) {
+      continue;
+    }
+    
+    // Feature 4: Recruitment Filter Gate
+    var industryText = getCanonical(leadsSheet, r, mapping, "industry");
+    if (isRecruitmentIndustry(industryText, config)) {
+      pipelineStageRange.setValue("Disqualified — Recruitment Industry");
+      if (headersMap["Outreach Status"]) leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Disqualified");
+      continue;
+    }
+    
+    // Feature 1: Flag rows with no resolvable email before wasting API credits
+    if (flagIfMissingEmail(leadsSheet, r, mapping, headersMap)) continue;
+    
     // Ensure company is validated first
     var companyValStatus = leadsSheet.getRange(r, headersMap["Company Validation Status"]).getValue().toString().trim();
     if (companyValStatus === "") {
@@ -319,7 +401,7 @@ function runFullPipelineMenu() {
       if (headersMap["Company Validation Reason"] && valResult.reason) {
         leadsSheet.getRange(r, headersMap["Company Validation Reason"]).setValue(valResult.reason);
       }
-      leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue(companyValStatus === "Verified" ? "Company Verified" : "Needs Review");
+      pipelineStageRange.setValue(companyValStatus === "Verified" ? "Company Verified" : "Needs Review");
     }
     
     if (companyValStatus !== "Verified") {
@@ -330,11 +412,26 @@ function runFullPipelineMenu() {
     var scoreRange = leadsSheet.getRange(r, headersMap["Score"]);
     var scoreVal = scoreRange.getValue().toString().trim();
     var existingReason = leadsSheet.getRange(r, headersMap["Score Reason"]).getValue().toString().trim();
-    var isScoreEmptyOrError = (scoreVal === "" || scoreVal.indexOf("Error") !== -1 || isNaN(scoreVal));
+    
+    // Feature 3: A valid numeric score (1-10) is treated as a manual override — skip AI entirely.
+    var scoreAsNum = parseFloat(scoreVal);
+    var isValidManualScore = (!isNaN(scoreAsNum) && scoreAsNum >= 1 && scoreAsNum <= 10 &&
+                              scoreVal.indexOf("Error") === -1);
+    var isScoreEmptyOrError = (scoreVal === "" || scoreVal.indexOf("Error") !== -1 || isNaN(scoreAsNum));
     var isReasonEmptyOrError = (existingReason === "" || existingReason.indexOf("Error") !== -1);
     
-    // Idempotency Step 1: AI Scoring (if empty or error or reason has error)
-    if (isScoreEmptyOrError || isReasonEmptyOrError) {
+    // Idempotency Step 1: AI Scoring or Manual Override
+    if (isValidManualScore) {
+      // Manual score path
+      var scoreSourceRange = headersMap["Score Source"] ? leadsSheet.getRange(r, headersMap["Score Source"]) : null;
+      if (scoreSourceRange && scoreSourceRange.getValue().toString().trim() === "") {
+        scoreSourceRange.setValue("Manual");
+      }
+      if (existingReason === "") {
+        leadsSheet.getRange(r, headersMap["Score Reason"]).setValue("Manual Override");
+      }
+      pipelineStageRange.setValue("Scored");
+    } else if (isScoreEmptyOrError || isReasonEmptyOrError) {
       processed++;
       
       // Look up hiring status if it hasn't been fetched yet
@@ -345,17 +442,25 @@ function runFullPipelineMenu() {
         }
       }
       
-      var scoreResult = scoreSingleLead(leadsSheet, r, headersMap, config);
+      var scoreResult = scoreSingleLead(leadsSheet, r, headersMap, config, mapping);
       if (scoreResult.success) {
         scoredThisRun++;
         scoreVal = scoreResult.score; // Use newly generated score
-        leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue("Scored");
+        pipelineStageRange.setValue("Scored");
+        if (headersMap["Score Source"]) leadsSheet.getRange(r, headersMap["Score Source"]).setValue("AI");
       } else {
         errors.push("Row " + r + " Scoring: " + scoreResult.error);
         Utilities.sleep(3000); // Sleep before continuing to prevent API spamming
         continue; // Skip validation since scoring failed
       }
       Utilities.sleep(3000); // Sleep after a successful API call
+    } else {
+      // Feature 3: Manual Score
+      var scoreSourceRange = headersMap["Score Source"] ? leadsSheet.getRange(r, headersMap["Score Source"]) : null;
+      if (scoreSourceRange && scoreSourceRange.getValue().toString().trim() === "") {
+        scoreSourceRange.setValue("Manual");
+        pipelineStageRange.setValue("Scored");
+      }
     }
     
     // Idempotency Step 2: Email Validation & Outreach Status (if score exists)

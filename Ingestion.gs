@@ -320,9 +320,21 @@ function mapApolloContactToRow(contact, headersMap) {
   
   var org = contact.organization || {};
   
-  // Basic personal details
-  setVal("First Name", contact.first_name);
-  setVal("Last Name", contact.last_name);
+  // Basic personal details (Feature 2: AI Name Splitting)
+  var firstName = contact.first_name || "";
+  var lastName = contact.last_name || "";
+  
+  if (!lastName && firstName.indexOf(" ") !== -1) {
+    var split = splitNameWithAI(firstName);
+    if (split) {
+      setVal("Raw Name Backup", firstName); // Saves the unparsed string to Backup column
+      firstName = split.first_name || firstName;
+      lastName = split.last_name || "";
+    }
+  }
+  
+  setVal("First Name", firstName);
+  setVal("Last Name", lastName);
   setVal("Title", contact.title);
   setVal("Company", org.name || contact.organization_name);
   setVal("Company Name for Emails", org.name || contact.organization_name);
@@ -536,9 +548,21 @@ function runLinkedInXRayIngestionPipeline() {
       if (parts.length >= 2) role = parts[1].trim();
       if (parts.length >= 3) company = parts[2].split(" | ")[0].split(" - ")[0].trim();
       
-      var nameParts = name.split(" ");
-      var firstName = nameParts[0] || "";
-      var lastName = nameParts.slice(1).join(" ") || "";
+      // Feature 2: AI name splitting for LinkedIn X-Ray
+      var firstName = name;
+      var lastName = "";
+      if (name.indexOf(" ") !== -1) {
+        var aiSplit = splitNameWithAI(name);
+        if (aiSplit) {
+          firstName = aiSplit.first_name || name;
+          lastName = aiSplit.last_name || "";
+        } else {
+          // Graceful fallback: naive split if AI unavailable
+          var np = name.split(" ");
+          firstName = np[0];
+          lastName = np.slice(1).join(" ");
+        }
+      }
       
       var maxColIdx = 0;
       for (var key in headersMap) {
@@ -555,6 +579,7 @@ function runLinkedInXRayIngestionPipeline() {
         if (idx) row[idx - 1] = val !== undefined && val !== null ? val : "";
       }
       
+      if (name !== firstName) { setVal("Raw Name Backup", name); }
       setVal("First Name", firstName);
       setVal("Last Name", lastName);
       setVal("Title", role);
@@ -636,9 +661,21 @@ function runGitHubIngestionPipeline() {
         var prof = JSON.parse(profRes.getContentText());
         
         var fullName = prof.name || prof.login || "";
-        var nameParts = fullName.split(" ");
-        var firstName = nameParts[0] || "";
-        var lastName = nameParts.slice(1).join(" ") || "";
+        
+        // Feature 2: AI name splitting for GitHub profiles
+        var firstName = fullName;
+        var lastName = "";
+        if (fullName.indexOf(" ") !== -1) {
+          var aiSplit = splitNameWithAI(fullName);
+          if (aiSplit) {
+            firstName = aiSplit.first_name || fullName;
+            lastName = aiSplit.last_name || "";
+          } else {
+            var np = fullName.split(" ");
+            firstName = np[0];
+            lastName = np.slice(1).join(" ");
+          }
+        }
         
         var company = prof.company || "";
         if (company.startsWith("@")) company = company.substring(1);
@@ -658,6 +695,7 @@ function runGitHubIngestionPipeline() {
           if (idx) row[idx - 1] = val !== undefined && val !== null ? val : "";
         }
         
+        if (fullName !== firstName) { setVal("Raw Name Backup", fullName); }
         setVal("First Name", firstName);
         setVal("Last Name", lastName);
         setVal("Title", role);
@@ -792,5 +830,197 @@ function runGoogleMapsIngestionPipeline() {
     ui.alert("Google Maps Ingestion Done", "Successfully ingested " + addedCount + " companies from Google Maps.", ui.ButtonSet.OK);
   } catch(e) {
     ui.alert("Google Maps Ingestion Error", e.toString(), ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Feature 2: Helper to intelligently split South Indian or complex names using Gemini API.
+ */
+function splitNameWithAI(fullName) {
+  var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey || !fullName) return null;
+  
+  var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + apiKey;
+  var prompt = "I have a full name from a lead generation list that was placed entirely in the First Name field. I need to split it into a logical 'first_name' and 'last_name'.\n\n" +
+               "Name: " + fullName + "\n\n" +
+               "Note: Handle South Indian names properly (e.g. initial as last name or first name depending on standard conventions). Reply ONLY with valid JSON in this format: {\"first_name\": \"...\", \"last_name\": \"...\"}";
+               
+  var payload = {
+    "contents": [{ "parts": [{ "text": prompt }] }],
+    "generationConfig": {
+      "responseMimeType": "application/json",
+      "temperature": 0.1
+    }
+  };
+  
+  var options = {
+    "method": "post",
+    "headers": { "Content-Type": "application/json" },
+    "payload": JSON.stringify(payload),
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(url, options);
+    if (response.getResponseCode() === 200) {
+      var json = JSON.parse(response.getContentText());
+      if (json.candidates && json.candidates[0] && json.candidates[0].content) {
+        var text = json.candidates[0].content.parts[0].text;
+        return JSON.parse(text);
+      }
+    }
+  } catch(e) {
+    Logger.log("Name split AI error: " + e.toString());
+  }
+  return null;
+}
+
+/**
+ * Feature 7: Manual Apollo enrichment for selected rows.
+ * Reads the emails/domains of selected rows and hits the bulk_match endpoint.
+ */
+function enrichSelectedRows() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var leadsSheet = ss.getSheetByName("Leads");
+  
+  if (!leadsSheet) {
+    ui.alert("Error", "Leads sheet not found.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var props = PropertiesService.getScriptProperties();
+  var apiKey = props.getProperty("APOLLO_API_KEY");
+  if (!apiKey) {
+    ui.alert("Apollo API Key Missing", "Please set APOLLO_API_KEY in Script Properties.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var activeRange = leadsSheet.getActiveRange();
+  if (!activeRange) {
+    ui.alert("No Selection", "Please select the rows you want to enrich.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var startRow = activeRange.getRow();
+  var numRows = activeRange.getNumRows();
+  var endRow = startRow + numRows - 1;
+  var lastRow = leadsSheet.getLastRow();
+  
+  if (startRow < 2) startRow = 2; // skip header
+  if (endRow > lastRow) endRow = lastRow;
+  
+  if (startRow > endRow) {
+    ui.alert("Invalid Selection", "Selected range contains no valid data rows.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var headersMap = getHeadersMap(leadsSheet);
+  var mapping = resolveColumnMapping(leadsSheet, true);
+  
+  var toEnrich = [];
+  var rowIndexMap = [];
+  
+  for (var r = startRow; r <= endRow; r++) {
+    var email = getCanonical(leadsSheet, r, mapping, "email");
+    var domain = getCanonical(leadsSheet, r, mapping, "company"); // Usually website or company domain is better but we try email domains first if available or website
+    var website = headersMap["Website"] ? leadsSheet.getRange(r, headersMap["Website"]).getValue() : "";
+    var fName = getCanonical(leadsSheet, r, mapping, "first_name");
+    var lName = getCanonical(leadsSheet, r, mapping, "last_name");
+    
+    var obj = {};
+    if (email) obj.email = email;
+    if (fName) obj.first_name = fName;
+    if (lName) obj.last_name = lName;
+    if (website) obj.domain = website.replace(/^(https?:\/\/)?(www\.)?/, "").split("/")[0];
+    
+    if (Object.keys(obj).length > 0) {
+      toEnrich.push(obj);
+      rowIndexMap.push(r);
+    }
+  }
+  
+  if (toEnrich.length === 0) {
+    ui.alert("No Data", "No valid data found in selected rows to match against Apollo.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  if (toEnrich.length > 50) {
+    ui.alert("Limit Exceeded", "Please select a maximum of 50 rows per batch for bulk enrichment.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  ui.showModelessDialog(HtmlService.createHtmlOutput("<p>Enriching " + toEnrich.length + " contacts...</p>").setWidth(300).setHeight(80), "Apollo Enrichment");
+  
+  var matchPayload = { "details": toEnrich };
+  var matchOptions = {
+    "method": "post",
+    "contentType": "application/json",
+    "headers": {
+      "Cache-Control": "no-cache",
+      "X-Api-Key": apiKey
+    },
+    "payload": JSON.stringify(matchPayload),
+    "muteHttpExceptions": true
+  };
+  
+  var matchUrl = "https://api.apollo.io/api/v1/people/bulk_match";
+  var matchResponse = UrlFetchApp.fetch(matchUrl, matchOptions);
+  
+  if (matchResponse.getResponseCode() === 200) {
+    var matchResult = JSON.parse(matchResponse.getContentText());
+    var matches = matchResult.matches || [];
+    
+    var enrichedCount = 0;
+    var noMatchCount = 0;
+    
+    // Apollo returns matches in the same order as the input `details` array.
+    // Nulls or empty objects mean no match was found for that input.
+    for (var i = 0; i < rowIndexMap.length; i++) {
+      var r = rowIndexMap[i];
+      var match = matches[i]; // may be null/undefined if Apollo found nothing
+      
+      if (!match || !match.id) {
+        // No match — tag the row so the user knows enrichment ran but found nothing
+        if (headersMap["Enrichment Status"]) {
+          leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("No Match");
+        }
+        noMatchCount++;
+        continue;
+      }
+      
+      // Match found — write back missing fields
+      var existingEmail = getCanonical(leadsSheet, r, mapping, "email");
+      if (!existingEmail && match.email) {
+        if (headersMap["Email"]) leadsSheet.getRange(r, headersMap["Email"]).setValue(match.email);
+        if (headersMap["Email Status"]) leadsSheet.getRange(r, headersMap["Email Status"]).setValue(match.email_status || "Found (Apollo)");
+        enrichedCount++;
+      }
+      
+      // Write mobile phone if missing
+      var mobile = (match.phone_numbers || []).filter(function(p){ return p.type === "mobile"; })[0];
+      if (mobile && headersMap["Mobile Phone"]) {
+        var existingPhone = leadsSheet.getRange(r, headersMap["Mobile Phone"]).getValue().toString().trim();
+        if (!existingPhone) {
+          leadsSheet.getRange(r, headersMap["Mobile Phone"]).setValue(mobile.sanitized_number || mobile.number);
+        }
+      }
+      
+      // Tag the row with enrichment source
+      if (headersMap["Enrichment Status"]) {
+        leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("Apollo Enrichment");
+      }
+    }
+    
+    ui.alert(
+      "Enrichment Complete",
+      "Apollo enrichment finished!\n\n" +
+      "- Rows submitted: " + rowIndexMap.length + "\n" +
+      "- Contacts enriched with email/phone: " + enrichedCount + "\n" +
+      "- No match found: " + noMatchCount,
+      ui.ButtonSet.OK
+    );
+  } else {
+    ui.alert("Apollo Enrichment Error", matchResponse.getContentText(), ui.ButtonSet.OK);
   }
 }

@@ -11,23 +11,27 @@
  * @param {number} rowNumber The row number to process (1-indexed)
  * @param {object} headersMap Mapping of header names to 1-indexed column numbers
  * @param {object} config Configuration parameters read from Config sheet
- * @param {string} apiKey Unused in failover (keys are pulled from Script Properties)
+ * @param {object} mapping Result of resolveColumnMapping
  * @return {object} Object with {success, score, reason, error}
  */
-function scoreSingleLead(sheet, rowNumber, headersMap, config, apiKey) {
+function scoreSingleLead(sheet, rowNumber, headersMap, config, mapping) {
   try {
-    // 1. Extract values for the row using headersMap
-    var company = sheet.getRange(rowNumber, headersMap["Company"]).getValue() || "";
-    var annualRevenue = sheet.getRange(rowNumber, headersMap["Annual Revenue"]).getValue() || "";
-    var totalFunding = sheet.getRange(rowNumber, headersMap["Total Funding"]).getValue() || "";
-    var latestFunding = sheet.getRange(rowNumber, headersMap["Latest Funding"]).getValue() || "";
-    var latestFundingAmount = sheet.getRange(rowNumber, headersMap["Latest Funding Amount"]).getValue() || "";
-    var lastRaisedAt = sheet.getRange(rowNumber, headersMap["Last Raised At"]).getValue() || "";
-    var hiringStatus = headersMap["Hiring Status"] ? sheet.getRange(rowNumber, headersMap["Hiring Status"]).getValue() || "" : "";
-    var employees = headersMap["# Employees"] ? sheet.getRange(rowNumber, headersMap["# Employees"]).getValue() || "" : "";
-    var technologies = headersMap["Technologies"] ? sheet.getRange(rowNumber, headersMap["Technologies"]).getValue() || "" : "";
-    var city = headersMap["City"] ? sheet.getRange(rowNumber, headersMap["City"]).getValue() || "" : "";
-    var country = headersMap["Country"] ? sheet.getRange(rowNumber, headersMap["Country"]).getValue() || "" : "";
+    // 1. Extract values for the row using generic mapping where possible
+    var company = getCanonical(sheet, rowNumber, mapping, "company");
+    var annualRevenue = getCanonical(sheet, rowNumber, mapping, "revenue");
+    var totalFunding = getCanonical(sheet, rowNumber, mapping, "funding_date"); // This maps to "Total Funding" in aliases? No, wait. "funding_date" maps to Last Raised At.
+    // Wait, the canonical fields are defined in Mapping.gs. Let me use headersMap as fallback for non-canonical fields.
+    var totalFunding = headersMap["Total Funding"] ? sheet.getRange(rowNumber, headersMap["Total Funding"]).getValue() : "";
+    var latestFunding = headersMap["Latest Funding"] ? sheet.getRange(rowNumber, headersMap["Latest Funding"]).getValue() : "";
+    var latestFundingAmount = headersMap["Latest Funding Amount"] ? sheet.getRange(rowNumber, headersMap["Latest Funding Amount"]).getValue() : "";
+    var lastRaisedAt = getCanonical(sheet, rowNumber, mapping, "funding_date") || (headersMap["Last Raised At"] ? sheet.getRange(rowNumber, headersMap["Last Raised At"]).getValue() : "");
+    var hiringStatus = headersMap["Hiring Status"] ? sheet.getRange(rowNumber, headersMap["Hiring Status"]).getValue() : "";
+    var employees = getCanonical(sheet, rowNumber, mapping, "employee_count");
+    var technologies = headersMap["Technologies"] ? sheet.getRange(rowNumber, headersMap["Technologies"]).getValue() : "";
+    
+    // City and Country aren't canonicalized yet, use headersMap
+    var city = headersMap["City"] ? sheet.getRange(rowNumber, headersMap["City"]).getValue() : "";
+    var country = headersMap["Country"] ? sheet.getRange(rowNumber, headersMap["Country"]).getValue() : "";
     
     // 2. Build the prompt using the template and values
     var prompt = config.promptTemplate

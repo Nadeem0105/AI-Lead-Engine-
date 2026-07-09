@@ -20,7 +20,8 @@ var APOLLO_COLUMNS = [
 // Define our new custom tracking columns
 var CUSTOM_COLUMNS = [
   "Score", "Score Reason", "Validation Status", "Validation Reason", "Outreach Status", "Hiring Status",
-  "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage", "Last Sent At", "Replied", "Follow-up Status", "Send From Account"
+  "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage", "Last Sent At", "Replied", "Follow-up Status", "Thread Id", "Send From Account",
+  "Raw Name Backup", "Score Source", "Enrichment Status"
 ];
 
 // Define default config values
@@ -104,7 +105,23 @@ var DEFAULT_CONFIG = [
   ["Account B Email", "sender2@company.com", "Email address for Account B"],
   ["Account B Label", "Harshith - Butter Search", "Display name for Account B"],
   ["Account B Signature", "Best regards,\nHarshith\nButter Search", "Email signature for Account B"],
-  ["Default Send Account", "Account A", "Default account to use for sending (Account A or Account B)"]
+  ["Default Send Account", "Account A", "Default account to use for sending (Account A or Account B)"],
+  // --- Batch 2 additions ---
+  ["Recruitment Industry Keywords", "recruitment,staffing,talent acquisition,executive search,hr consulting,headhunting,recruiting,staffing agency", "Comma-separated keywords. Any lead whose Industry/Keywords matches is hard-blocked from outreach regardless of score (Feature 4)."],
+  ["Score Band High Accounts", "Account A,Account B", "Comma-separated account pool for leads scoring >= 8 (Feature 5). One is chosen at random, respecting send caps."],
+  ["Score Band Mid Accounts", "Account C,Account D,Account E", "Comma-separated account pool for leads scoring 6-7.9 (Feature 5)."],
+  ["Score Band Low Behavior", "Default", "What to do with leads scoring < 6 for account routing: 'Default' (use Default Send Account) or 'Hold' (do not route) (Feature 5)."],
+  ["Draft Quality Threshold", "7", "Ready to Send tab: drafts scoring above this (1-10) default to Ready for Send = TRUE (Feature 8)."],
+  ["Sender Source", "MainSheet", "Where the hourly sender pulls candidates: 'MainSheet' (existing behavior) or 'ReadyTab' (Ready to Send tab, Feature 8)."],
+  ["Account C Email", "", "Email address for Account C (Feature 5 scaffold — fill in to activate)."],
+  ["Account C Label", "", "Display name for Account C."],
+  ["Account C Signature", "", "Email signature for Account C."],
+  ["Account D Email", "", "Email address for Account D (Feature 5 scaffold — fill in to activate)."],
+  ["Account D Label", "", "Display name for Account D."],
+  ["Account D Signature", "", "Email signature for Account D."],
+  ["Account E Email", "", "Email address for Account E (Feature 5 scaffold — fill in to activate)."],
+  ["Account E Label", "", "Display name for Account E."],
+  ["Account E Signature", "", "Email signature for Account E."]
 ];
 
 function setupSheetStructure() {
@@ -183,18 +200,34 @@ function setupSheetStructure() {
     
     configSheet.autoResizeColumns(1, 3);
     
-    // 3. Setup "Log" Sheet
+    // 5. Setup "Log" Sheet
     var logSheet = ss.getSheetByName("Log");
-    var logHeaders = ["Timestamp", "Rows Processed", "Rows Scored", "Rows Flagged", "Errors"];
     if (!logSheet) {
       logSheet = ss.insertSheet("Log");
-      logSheet.appendRow(logHeaders);
-      formatHeaderRow(logSheet);
-      logSheet.autoResizeColumns(1, 5);
+      logSheet.appendRow(["Timestamp", "Rows Processed", "Rows Scored", "Validation Flags", "Errors"]);
+      logSheet.getRange("A1:E1").setFontWeight("bold").setBackground("#d1d5db");
+      logSheet.setColumnWidth(1, 150);
+      logSheet.setColumnWidth(5, 400);
       Logger.log("Created 'Log' sheet.");
     } else {
       Logger.log("'Log' sheet already exists.");
     }
+    
+    // 6. Setup "Ready to Send" Sheet (Feature 8)
+    var readySheet = ss.getSheetByName("Ready to Send");
+    if (!readySheet) {
+      readySheet = ss.insertSheet("Ready to Send");
+      readySheet.appendRow([
+        "Draft ID", "Timestamp", "Company", "First Name", "Last Name", "Email", 
+        "Selected Account", "Score", "Draft Quality Score", "Subject", "Body", "Ready for Send"
+      ]);
+      formatHeaderRow(readySheet);
+      // Add checkboxes to the Ready for Send column
+      readySheet.getRange(2, 12, 999, 1).insertCheckboxes();
+      Logger.log("Created 'Ready to Send' sheet.");
+    }
+
+    ui.alert("Setup Complete", "All sheets and standard structures have been initialized.", ui.ButtonSet.OK);
     
     // 3b. Setup "Templates" Sheet
     var templatesSheet = ss.getSheetByName("Templates");
@@ -216,13 +249,17 @@ function setupSheetStructure() {
        "Account B"],
       ["Follow-up Template", "Re: Top talent hiring at {Company}",
        "Hi {First Name},\n\n" +
-       "I wanted to quickly follow up on my previous email. I know you're busy, but I'd love to see if you have 5 minutes for a quick chat about supporting your hiring needs at {Company}.\n\n" +
-       "Best,\nAyush",
+       "Just following up on my earlier note \u2014 completely understand things get busy.\n\n" +
+       "{AI_INSIGHT}\n\n" +
+       "Happy to connect for a quick call to explore how we might partner effectively.\n\n" +
+       "Looking forward to hearing from you.",
        "Account A"],
       ["Follow-up Template", "Re: Top talent hiring at {Company}",
        "Hi {First Name},\n\n" +
-       "I wanted to quickly follow up on my previous email. I know you're busy, but I'd love to see if you have 5 minutes for a quick chat about supporting your hiring needs at {Company}.\n\n" +
-       "Best,\nHarshith",
+       "Just following up on my earlier note \u2014 completely understand things get busy.\n\n" +
+       "{AI_INSIGHT}\n\n" +
+       "Happy to connect for a quick call to explore how we might partner effectively.\n\n" +
+       "Looking forward to hearing from you.",
        "Account B"]
     ];
     if (!templatesSheet) {
@@ -250,6 +287,7 @@ function setupSheetStructure() {
 
 /**
  * Utility to style the header row of a sheet for premium visual design.
+ * Highlights essential/required columns with a different color on the Leads sheet.
  */
 function formatHeaderRow(sheet) {
   var lastCol = sheet.getLastColumn();
@@ -260,10 +298,42 @@ function formatHeaderRow(sheet) {
   
   var headerRange = sheet.getRange(1, 1, 1, lastCol);
   headerRange.setFontWeight("bold");
-  headerRange.setBackground("#f3f4f6"); // Cool grey background
+  headerRange.setBackground("#f3f4f6"); // Cool grey background by default
   headerRange.setFontColor("#1f2937"); // Dark charcoal font
   headerRange.setBorder(null, null, true, null, null, null, "#d1d5db", SpreadsheetApp.BorderStyle.SOLID);
   sheet.setRowHeight(1, 26);
+
+  // If this is the Leads sheet, highlight the bare minimum essential columns
+  if (sheet.getName() === "Leads") {
+    var headers = headerRange.getValues()[0];
+    var essentialCols = [
+      "First Name", "Company", "Email", 
+      "Annual Revenue", "# Employees", 
+      "Total Funding", "Latest Funding", 
+      "Hiring Status"
+    ];
+    
+    for (var c = 0; c < headers.length; c++) {
+      if (essentialCols.indexOf(headers[c].toString().trim()) !== -1) {
+        // Highlight with a soft yellow to indicate importance/required
+        sheet.getRange(1, c + 1).setBackground("#fef08a");
+      }
+    }
+  }
+}
+
+/**
+ * Menu wrapper to re-apply header formatting manually.
+ */
+function applyHeaderFormattingMenu() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var leadsSheet = ss.getSheetByName("Leads");
+  if (leadsSheet) {
+    formatHeaderRow(leadsSheet);
+    SpreadsheetApp.getUi().alert("Success", "Essential columns have been highlighted in yellow.", SpreadsheetApp.getUi().ButtonSet.OK);
+  } else {
+    SpreadsheetApp.getUi().alert("Error", "Leads sheet not found.", SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }
 
 /**
@@ -640,7 +710,10 @@ function applyLeadDropdownValidations(leadsSheet) {
   // --- Column: Send From Account ---
   applyDropdown("Send From Account", [
     "Account A",
-    "Account B"
+    "Account B",
+    "Account C",
+    "Account D",
+    "Account E"
   ]);
 
   // --- Column: Hiring Status ---
@@ -657,6 +730,26 @@ function applyLeadDropdownValidations(leadsSheet) {
     "Done",
     "Skipped"
   ]);
+
+  // --- Column: Score (Feature 3) ---
+  // Score is an OPEN INPUT (blank = run AI scoring; 1-10 = manual override).
+  // Apply a numeric 1-10 validation but allow invalid so the script and manual
+  // entries are never blocked; clear any legacy dropdown rule on this column.
+  if (headersMap["Score"]) {
+    var scoreRule = SpreadsheetApp.newDataValidation()
+      .requireNumberBetween(1, 10)
+      .setAllowInvalid(true)
+      .setHelpText("Leave blank to let AI score this lead, or enter a number 1-10 to set the score manually.")
+      .build();
+    leadsSheet.getRange(2, headersMap["Score"], lastRow - 1, 1).setDataValidation(scoreRule);
+  }
+
+  // --- Hidden internal columns (Batch 2) ---
+  ["Raw Name Backup", "Score Source"].forEach(function(col) {
+    if (headersMap[col]) {
+      leadsSheet.hideColumns(headersMap[col]);
+    }
+  });
 
   Logger.log("All dropdown validations applied successfully.");
 }

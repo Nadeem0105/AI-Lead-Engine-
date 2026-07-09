@@ -50,6 +50,14 @@ function validateEmailQuality(sheet, rowNumber, headersMap, config) {
       };
     }
     
+    // Feature 6: If Email Status is "Verified", immediately return Ready without hitting ZeroBounce
+    if (emailStatusLower === "verified") {
+      return { 
+        status: "Ready", 
+        reason: "Verified (Apollo)" 
+      };
+    }
+    
     // 3. Check if email needs verification (Catch-all, Guessed, or Low Confidence)
     var needsVerification = false;
     var riskReason = "";
@@ -77,14 +85,6 @@ function validateEmailQuality(sheet, rowNumber, headersMap, config) {
       return { 
         status: "Risky", 
         reason: riskReason 
-      };
-    }
-    
-    // 4. If Email Status is "Verified" -> Ready
-    if (emailStatusLower === "verified") {
-      return { 
-        status: "Ready", 
-        reason: "Email verified and safe" 
       };
     }
     
