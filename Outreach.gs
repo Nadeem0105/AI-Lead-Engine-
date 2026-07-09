@@ -37,9 +37,9 @@ function promptAccountSelection() {
   var response = ui.alert(
     "Choose Sending Account",
     "Which email account should be used to send these emails?\n\n" +
-    "\u2022 Yes  \u2192  Account A (Ayush)\n" +
-    "\u2022 No   \u2192  Account B (Harshith)\n" +
-    "\u2022 Cancel  \u2192  Use each row\u2019s existing 'Send From Account' setting",
+    "\u2022 Yes  \u2192  Force Account A (Ayush)\n" +
+    "\u2022 No   \u2192  Force Account B (Harshith)\n" +
+    "\u2022 Cancel  \u2192  Use AUTOMATIC routing (Score Bands or Row settings)",
     ui.ButtonSet.YES_NO_CANCEL
   );
   if (response === ui.Button.YES)  return "Account A";
@@ -240,13 +240,8 @@ function processOutreachInternal(isHourly, selectedOnly, isManualBatch) {
     var scoreVal = leadsSheet.getRange(r, headersMap["Score"]).getValue().toString().trim();
     var lastSentAt = headersMap["Last Sent At"] ? leadsSheet.getRange(r, headersMap["Last Sent At"]).getValue().toString().trim() : "";
     
-    var scoreNum = 0;
-    if (scoreVal !== "" && !isNaN(scoreVal)) {
-      scoreNum = parseInt(scoreVal);
-    }
-    
-    // Gate 1: Qualified leads (Score >= 8), Validated (Ready), Outreach Status is Ready, and Not Sent
-    if (validationStatus === "Ready" && scoreNum >= 8 && outreachStatus === "Ready for outreach" && !lastSentAt) {
+    // Gate 1: Validated (Ready), Outreach Status is Ready for outreach, and Not Sent
+    if (validationStatus === "Ready" && outreachStatus === "Ready for outreach" && !lastSentAt) {
       processed++;
       
       var result = processSingleOutreach(leadsSheet, r, headersMap, config, outreachMode, testRecipient, forcedAccount);
