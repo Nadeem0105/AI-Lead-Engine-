@@ -145,6 +145,37 @@ function getHeadersMap(sheet) {
 }
 
 /**
+ * Feature 2 check: Automatically splits a full name in the First Name column
+ * into First Name and Last Name if Last Name is blank.
+ */
+function ensureNameSplit(sheet, r, headersMap) {
+  var firstNameRange = headersMap["First Name"] ? sheet.getRange(r, headersMap["First Name"]) : null;
+  var lastNameRange = headersMap["Last Name"] ? sheet.getRange(r, headersMap["Last Name"]) : null;
+  var rawNameRange = headersMap["Raw Name Backup"] ? sheet.getRange(r, headersMap["Raw Name Backup"]) : null;
+  
+  if (firstNameRange && lastNameRange) {
+    var fName = firstNameRange.getValue().toString().trim();
+    var lName = lastNameRange.getValue().toString().trim();
+    
+    if (fName && lName === "" && fName.indexOf(" ") !== -1) {
+      Logger.log("Manually imported name needs splitting: " + fName);
+      var splitResult = typeof splitNameWithAI === "function" ? splitNameWithAI(fName) : null;
+      if (splitResult && splitResult.first_name && splitResult.last_name) {
+        if (rawNameRange) rawNameRange.setValue(fName);
+        firstNameRange.setValue(splitResult.first_name);
+        lastNameRange.setValue(splitResult.last_name);
+      } else {
+        // Fallback naive split
+        var parts = fName.split(" ");
+        if (rawNameRange) rawNameRange.setValue(fName);
+        firstNameRange.setValue(parts[0]);
+        lastNameRange.setValue(parts.slice(1).join(" "));
+      }
+    }
+  }
+}
+
+/**
  * Logs a run event to the "Log" sheet.
  * 
  * @param {number} processedCount Number of rows scanned/processed
@@ -206,7 +237,13 @@ function runScoringOnlyMenu() {
   var headersMap = getHeadersMap(leadsSheet);
   var mapping = resolveColumnMapping(leadsSheet, true);
   
-  if (!validateHeadersPresent(ui, headersMap, ["Company", "Annual Revenue", "Total Funding", "Latest Funding", "Latest Funding Amount", "Last Raised At", "Score", "Score Reason", "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage"])) {
+  // Feature 1: only script-owned OUTPUT columns must exist literally (Setup Sheets adds them).
+  // DATA columns (Company, Revenue, Funding, Email...) resolve through the canonical mapping,
+  // so non-Apollo header names (e.g. "Organization") no longer abort the run.
+  if (!validateHeadersPresent(ui, headersMap, ["Score", "Score Reason", "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage"])) {
+    return;
+  }
+  if (!validateMappedFieldsPresent(ui, mapping, ["company", "email"])) {
     return;
   }
   
@@ -246,6 +283,8 @@ function runScoringOnlyMenu() {
       if (headersMap["Outreach Status"]) leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Disqualified");
       continue;
     }
+    // Feature 2: If this row was manually added and has no last name but a multi-part first name, split it now.
+    ensureNameSplit(leadsSheet, r, headersMap);
     
     // Feature 1: Flag rows with no resolvable email before wasting API credits
     if (flagIfMissingEmail(leadsSheet, r, mapping, headersMap)) continue;
@@ -253,7 +292,7 @@ function runScoringOnlyMenu() {
     // Ensure company is validated first
     var companyValStatus = leadsSheet.getRange(r, headersMap["Company Validation Status"]).getValue().toString().trim();
     if (companyValStatus === "") {
-      var valResult = validateCompanyDetails(leadsSheet, r, headersMap, config);
+      var valResult = validateCompanyDetails(leadsSheet, r, headersMap, config, mapping);
       companyValStatus = valResult.status;
       if (headersMap["Company Validation Reason"] && valResult.reason) {
         leadsSheet.getRange(r, headersMap["Company Validation Reason"]).setValue(valResult.reason);
@@ -338,15 +377,17 @@ function runFullPipelineMenu() {
   var headersMap = getHeadersMap(leadsSheet);
   var mapping = resolveColumnMapping(leadsSheet, true);
   
-  // Verify all required headers exist
+  // Feature 1: only script-owned OUTPUT columns must exist literally (Setup Sheets adds them).
+  // DATA columns resolve through the canonical mapping so generic-source sheets pass.
   var requiredHeaders = [
-    "Company", "Annual Revenue", "Total Funding", "Latest Funding", "Latest Funding Amount", "Last Raised At",
-    "Email", "Email Status", "Email Confidence", "Primary Email Catch-all Status",
     "Score", "Score Reason", "Validation Status", "Validation Reason", "Outreach Status",
     "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage"
   ];
-  
+
   if (!validateHeadersPresent(ui, headersMap, requiredHeaders)) {
+    return;
+  }
+  if (!validateMappedFieldsPresent(ui, mapping, ["company", "email"])) {
     return;
   }
   
@@ -389,6 +430,8 @@ function runFullPipelineMenu() {
       if (headersMap["Outreach Status"]) leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Disqualified");
       continue;
     }
+    // Feature 2: If this row was manually added and has no last name but a multi-part first name, split it now.
+    ensureNameSplit(leadsSheet, r, headersMap);
     
     // Feature 1: Flag rows with no resolvable email before wasting API credits
     if (flagIfMissingEmail(leadsSheet, r, mapping, headersMap)) continue;
@@ -396,7 +439,7 @@ function runFullPipelineMenu() {
     // Ensure company is validated first
     var companyValStatus = leadsSheet.getRange(r, headersMap["Company Validation Status"]).getValue().toString().trim();
     if (companyValStatus === "") {
-      var valResult = validateCompanyDetails(leadsSheet, r, headersMap, config);
+      var valResult = validateCompanyDetails(leadsSheet, r, headersMap, config, mapping);
       companyValStatus = valResult.status;
       if (headersMap["Company Validation Reason"] && valResult.reason) {
         leadsSheet.getRange(r, headersMap["Company Validation Reason"]).setValue(valResult.reason);
@@ -476,7 +519,7 @@ function runFullPipelineMenu() {
       
       // Step A: Run validation if missing
       if (existingValidation === "" && scoreNum >= 8) {
-        var validationResult = validateEmailQuality(leadsSheet, r, headersMap, config);
+        var validationResult = validateEmailQuality(leadsSheet, r, headersMap, config, mapping);
         existingValidation = validationResult.status;
         validationRange.setValue(existingValidation);
         if (validationReasonRange && validationResult.reason) {
@@ -612,6 +655,27 @@ function validateHeadersPresent(ui, headersMap, requiredHeaders) {
   for (var i = 0; i < requiredHeaders.length; i++) {
     if (!headersMap[requiredHeaders[i]]) {
       ui.alert("Error", "Missing required column in Leads sheet: '" + requiredHeaders[i] + "'. Please run Setup Sheets to restore defaults.", ui.ButtonSet.OK);
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Feature 1: Validates that required canonical fields could be resolved from the sheet's
+ * actual headers (whatever the source called them). Alerts with the accepted aliases on failure.
+ */
+function validateMappedFieldsPresent(ui, mapping, canonicalKeys) {
+  for (var i = 0; i < canonicalKeys.length; i++) {
+    var key = canonicalKeys[i];
+    if (!mapping[key]) {
+      var aliases = (CANONICAL_FIELDS[key] || []).join(", ");
+      ui.alert(
+        "Error",
+        "Could not find a '" + key + "' column in the Leads sheet under any accepted name.\n\n" +
+        "Accepted headers: " + aliases,
+        ui.ButtonSet.OK
+      );
       return false;
     }
   }

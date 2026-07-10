@@ -111,6 +111,7 @@ var DEFAULT_CONFIG = [
   ["Score Band High Accounts", "Account A,Account B", "Comma-separated account pool for leads scoring >= 8 (Feature 5). One is chosen at random, respecting send caps."],
   ["Score Band Mid Accounts", "Account C,Account D,Account E", "Comma-separated account pool for leads scoring 6-7.9 (Feature 5)."],
   ["Score Band Low Behavior", "Default", "What to do with leads scoring < 6 for account routing: 'Default' (use Default Send Account) or 'Hold' (do not route) (Feature 5)."],
+  ["Per Account Daily Cap", "40", "Maximum emails sent per account per day (Feature 5). If an account hits this cap, the system auto-routes to another account in the same band. Gmail free limit is ~500/day; Workspace is ~2000/day. 40 is a safe conservative default."],
   ["Draft Quality Threshold", "7", "Ready to Send tab: drafts scoring above this (1-10) default to Ready for Send = TRUE (Feature 8)."],
   ["Sender Source", "MainSheet", "Where the hourly sender pulls candidates: 'MainSheet' (existing behavior) or 'ReadyTab' (Ready to Send tab, Feature 8)."],
   ["Account C Email", "", "Email address for Account C (Feature 5 scaffold — fill in to activate)."],

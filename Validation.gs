@@ -13,17 +13,17 @@
  * @param {object} config Configuration parameters read from Config sheet
  * @return {object} Object with {status, reason} where status is 'Ready', 'Risky', or 'Flagged'
  */
-function validateEmailQuality(sheet, rowNumber, headersMap, config) {
+function validateEmailQuality(sheet, rowNumber, headersMap, config, mapping) {
   try {
-    var emailRange = sheet.getRange(rowNumber, headersMap["Email"]);
-    var email = (emailRange.getValue() || "").toString().trim();
-    
-    var emailStatus = sheet.getRange(rowNumber, headersMap["Email Status"]).getValue() || "";
+    // Feature 1: tolerate generic-source sheets where Apollo-specific columns are absent.
+    var email = getFieldValue(sheet, rowNumber, headersMap, mapping, "Email", "email");
+
+    var emailStatus = headersMap["Email Status"] ? (sheet.getRange(rowNumber, headersMap["Email Status"]).getValue() || "") : "";
     emailStatus = emailStatus.toString().trim();
-    
-    var emailConfidence = sheet.getRange(rowNumber, headersMap["Email Confidence"]).getValue();
-    
-    var catchAllStatus = sheet.getRange(rowNumber, headersMap["Primary Email Catch-all Status"]).getValue() || "";
+
+    var emailConfidence = headersMap["Email Confidence"] ? sheet.getRange(rowNumber, headersMap["Email Confidence"]).getValue() : "";
+
+    var catchAllStatus = headersMap["Primary Email Catch-all Status"] ? (sheet.getRange(rowNumber, headersMap["Primary Email Catch-all Status"]).getValue() || "") : "";
     catchAllStatus = catchAllStatus.toString().trim();
     
     var emailStatusLower = emailStatus.toLowerCase();
@@ -75,25 +75,28 @@ function validateEmailQuality(sheet, rowNumber, headersMap, config) {
         riskReason = "Email confidence (" + confidenceNum + ") below threshold (" + confidenceThreshold + ")";
       }
     }
-    
+
+    // Feature 6: anything other than an explicit Apollo "verified" must go through
+    // second-pass verification (ZeroBounce/Hunter) — including a blank or unrecognized
+    // status, which is the norm for non-Apollo sources.
+    if (!needsVerification) {
+      needsVerification = true;
+      riskReason = emailStatus === "" ? "No provider email status — needs verification"
+                                      : "Unrecognized email status: " + emailStatus;
+    }
+
     if (needsVerification) {
       var verifyResult = runSecondPassEnrichment(sheet, rowNumber, headersMap, config);
       if (verifyResult.status) {
         return verifyResult;
       }
-      // Return default risk status if no second-pass verification occurred
-      return { 
-        status: "Risky", 
-        reason: riskReason 
+      // No second-pass provider configured/reachable — mark Risky, never assume verified
+      return {
+        status: "Risky",
+        reason: riskReason
       };
     }
-    
-    // 5. Default Fallback
-    return { 
-      status: "Risky", 
-      reason: "Unrecognized email status: " + emailStatus 
-    };
-    
+
   } catch (e) {
     return { 
       status: "Flagged", 
@@ -117,15 +120,19 @@ function runSecondPassEnrichment(sheet, r, headersMap, config) {
   var hunterKey = props.getProperty("HUNTER_API_KEY") || config.hunterKey;
   var zeroBounceKey = props.getProperty("ZEROBOUNCE_API_KEY") || config.zeroBounceKey;
   
-  var emailRange = sheet.getRange(r, headersMap["Email"]);
+  // Feature 1: resolve columns tolerantly; generic sheets may lack Apollo-specific headers.
+  var mapping = resolveColumnMapping(sheet, false);
+  var emailCol = headersMap["Email"] || mapping["email"];
+  if (!emailCol) return { status: null, reason: null, emailUpdated: false };
+  var emailRange = sheet.getRange(r, emailCol);
   var email = (emailRange.getValue() || "").toString().trim();
-  
-  var statusRange = sheet.getRange(r, headersMap["Email Status"]);
-  
-  var firstName = (sheet.getRange(r, headersMap["First Name"]).getValue() || "").toString().trim();
-  var lastName = (sheet.getRange(r, headersMap["Last Name"]).getValue() || "").toString().trim();
-  var company = (sheet.getRange(r, headersMap["Company"]).getValue() || "").toString().trim();
-  var website = (sheet.getRange(r, headersMap["Website"]).getValue() || "").toString().trim();
+
+  var statusRange = headersMap["Email Status"] ? sheet.getRange(r, headersMap["Email Status"]) : null;
+
+  var firstName = getFieldValue(sheet, r, headersMap, mapping, "First Name", "first_name");
+  var lastName = getFieldValue(sheet, r, headersMap, mapping, "Last Name", "last_name");
+  var company = getFieldValue(sheet, r, headersMap, mapping, "Company", "company");
+  var website = getFieldValue(sheet, r, headersMap, mapping, "Website", null);
   
   // CASE A: Email is missing -> Try Hunter.io Email Finder
   if (!email && hunterKey && firstName && lastName && (website || company)) {
@@ -153,8 +160,8 @@ function runSecondPassEnrichment(sheet, r, headersMap, config) {
           var confidence = resObj.data.score || 0;
           
           emailRange.setValue(foundEmail);
-          statusRange.setValue("Found (Hunter)");
-          sheet.getRange(r, headersMap["Email Confidence"]).setValue(confidence / 100);
+          if (statusRange) statusRange.setValue("Found (Hunter)");
+          if (headersMap["Email Confidence"]) sheet.getRange(r, headersMap["Email Confidence"]).setValue(confidence / 100);
           
           Logger.log("Hunter.io found email: " + foundEmail + " (confidence: " + confidence + "%)");
           email = foundEmail; // Update variable for verification block below
@@ -182,22 +189,22 @@ function runSecondPassEnrichment(sheet, r, headersMap, config) {
           Logger.log("ZeroBounce status: " + zbStatus);
           
           if (zbStatus === "valid") {
-            statusRange.setValue("Verified (ZeroBounce)");
-            sheet.getRange(r, headersMap["Primary Email Catch-all Status"]).setValue("No");
+            if (statusRange) statusRange.setValue("Verified (ZeroBounce)");
+            if (headersMap["Primary Email Catch-all Status"]) sheet.getRange(r, headersMap["Primary Email Catch-all Status"]).setValue("No");
             return {
               status: "Ready",
               reason: "ZeroBounce verified deliverable",
               emailUpdated: true
             };
           } else if (zbStatus === "invalid" || zbStatus === "do_not_mail") {
-            statusRange.setValue("Invalid (ZeroBounce)");
+            if (statusRange) statusRange.setValue("Invalid (ZeroBounce)");
             return {
               status: "Flagged",
               reason: "ZeroBounce flagged: " + (resObj.sub_status || "invalid"),
               emailUpdated: true
             };
           } else {
-            statusRange.setValue("Risky (ZeroBounce: " + zbStatus + ")");
+            if (statusRange) statusRange.setValue("Risky (ZeroBounce: " + zbStatus + ")");
             return {
               status: "Risky",
               reason: "ZeroBounce labeled risky: " + zbStatus,
@@ -226,22 +233,22 @@ function runSecondPassEnrichment(sheet, r, headersMap, config) {
           Logger.log("Hunter.io verify result: " + hunterResult);
           
           if (hunterResult === "deliverable") {
-            statusRange.setValue("Verified (Hunter)");
-            sheet.getRange(r, headersMap["Primary Email Catch-all Status"]).setValue("No");
+            if (statusRange) statusRange.setValue("Verified (Hunter)");
+            if (headersMap["Primary Email Catch-all Status"]) sheet.getRange(r, headersMap["Primary Email Catch-all Status"]).setValue("No");
             return {
               status: "Ready",
               reason: "Hunter.io verified deliverable",
               emailUpdated: true
             };
           } else if (hunterResult === "undeliverable") {
-            statusRange.setValue("Invalid (Hunter)");
+            if (statusRange) statusRange.setValue("Invalid (Hunter)");
             return {
               status: "Flagged",
               reason: "Hunter.io verified undeliverable",
               emailUpdated: true
             };
           } else {
-            statusRange.setValue("Risky (Hunter: " + hunterResult + ")");
+            if (statusRange) statusRange.setValue("Risky (Hunter: " + hunterResult + ")");
             return {
               status: "Risky",
               reason: "Hunter.io verify result: " + hunterResult,
@@ -272,11 +279,13 @@ function runSecondPassEnrichment(sheet, r, headersMap, config) {
  * @param {object} config Configuration parameters
  * @return {object} Object with {status, reason}
  */
-function validateCompanyDetails(sheet, rowNumber, headersMap, config) {
+function validateCompanyDetails(sheet, rowNumber, headersMap, config, mapping) {
   try {
-    var company = (sheet.getRange(rowNumber, headersMap["Company"]).getValue() || "").toString().trim();
-    var website = (sheet.getRange(rowNumber, headersMap["Website"]).getValue() || "").toString().trim();
-    var industry = (sheet.getRange(rowNumber, headersMap["Industry"]).getValue() || "").toString().trim();
+    // Feature 1: read via literal header first, canonical mapping as fallback,
+    // and never throw when a column is absent on generic-source sheets.
+    var company = getFieldValue(sheet, rowNumber, headersMap, mapping, "Company", "company");
+    var website = getFieldValue(sheet, rowNumber, headersMap, mapping, "Website", null);
+    var industry = getFieldValue(sheet, rowNumber, headersMap, mapping, "Industry", "industry");
     var keywords = headersMap["Keywords"] ? (sheet.getRange(rowNumber, headersMap["Keywords"]).getValue() || "").toString().trim() : "";
     
     var statusRange = sheet.getRange(rowNumber, headersMap["Company Validation Status"]);

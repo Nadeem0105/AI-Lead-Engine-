@@ -58,12 +58,22 @@ function selectAccountByScore(score, config) {
   if (isNaN(score) || score === "") return null;
   var scoreNum = parseFloat(score);
   
+  var dailyCap = parseInt(getConfigValue(config, "Per Account Daily Cap", "40")) || 40;
+  
   if (scoreNum >= 8) {
     var highPool = (config["Score Band High Accounts"] || "").split(",");
-    return getRandomAccountFromPool(highPool);
-  } else if (scoreNum >= 6) {
+    var chosen = getAvailableAccountFromPool(highPool, dailyCap, config);
+    if (chosen) return chosen;
+    // All high-band accounts at cap — fall through to mid band
+    Logger.log("All high-band accounts at daily cap. Falling back to mid band.");
+  }
+  
+  if (scoreNum >= 6) {
     var midPool = (config["Score Band Mid Accounts"] || "").split(",");
-    return getRandomAccountFromPool(midPool);
+    var chosen = getAvailableAccountFromPool(midPool, dailyCap, config);
+    if (chosen) return chosen;
+    Logger.log("All mid-band accounts at daily cap. No eligible account found.");
+    return "HOLD"; // All accounts at cap — hold the row rather than exceed cap
   }
   
   var lowBehavior = (config["Score Band Low Behavior"] || "Default").trim();
@@ -71,6 +81,49 @@ function selectAccountByScore(score, config) {
     return "HOLD"; // Special flag to prevent sending
   }
   return null;
+}
+
+/**
+ * Returns a randomly selected account from the pool that is still under its daily send cap.
+ * Returns null if all accounts in the pool are at or above the cap.
+ */
+function getAvailableAccountFromPool(pool, dailyCap, config) {
+  var availableAccounts = [];
+  for (var i = 0; i < pool.length; i++) {
+    var acc = pool[i].toString().trim();
+    if (!acc) continue;
+    var sentToday = getAccountSentToday(acc);
+    if (sentToday < dailyCap) {
+      availableAccounts.push(acc);
+    } else {
+      Logger.log("Account '" + acc + "' at daily cap (" + sentToday + "/" + dailyCap + "). Skipping.");
+    }
+  }
+  if (availableAccounts.length === 0) return null;
+  return availableAccounts[Math.floor(Math.random() * availableAccounts.length)];
+}
+
+/**
+ * Returns how many emails have been sent by this account today.
+ * Count is stored in Script Properties under the key: account_sent_YYYY-MM-DD_AccountName
+ */
+function getAccountSentToday(accountName) {
+  var props = PropertiesService.getScriptProperties();
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  var key = "account_sent_" + today + "_" + accountName;
+  return parseInt(props.getProperty(key) || "0");
+}
+
+/**
+ * Increments the per-account send counter for today.
+ * Call this immediately after a successful send for an account.
+ */
+function recordAccountSend(accountName) {
+  var props = PropertiesService.getScriptProperties();
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
+  var key = "account_sent_" + today + "_" + accountName;
+  var current = parseInt(props.getProperty(key) || "0");
+  props.setProperty(key, (current + 1).toString());
 }
 
 function getRandomAccountFromPool(pool) {
@@ -82,6 +135,7 @@ function getRandomAccountFromPool(pool) {
   if (validAccounts.length === 0) return null;
   return validAccounts[Math.floor(Math.random() * validAccounts.length)];
 }
+
 
 /**
  * Applies a warning-only protection to the 'Send From Account' cell in a given row
@@ -147,10 +201,10 @@ function processOutreachInternal(isHourly, selectedOnly, isManualBatch) {
   
   var headersMap = getHeadersMap(leadsSheet);
   
-  // Verify required columns exist
+  // Verify required columns exist — literal check only for script-owned OUTPUT columns
+  // (Feature 1: data columns like Company/Email resolve via canonical mapping downstream).
   var required = [
-    "First Name", "Last Name", "Title", "Company", "Email", "Validation Status", 
-    "Outreach Status", "Annual Revenue", "Latest Funding", "Score", "Pipeline Stage"
+    "Validation Status", "Outreach Status", "Score", "Pipeline Stage"
   ];
   for (var i = 0; i < required.length; i++) {
     if (!headersMap[required[i]]) {
@@ -429,11 +483,14 @@ function generateSelectedDrafts() {
  */
 function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMode, testRecipient, forcedAccount) {
   try {
-    var originalEmail = sheet.getRange(rowNumber, headersMap["Email"]).getValue().toString().trim();
+    // Resolve source-agnostic column mapping once for this call (Feature 1)
+    var mapping = resolveColumnMapping(sheet, false);
+
+    var originalEmail = getFieldValue(sheet, rowNumber, headersMap, mapping, "Email", "email");
     if (!originalEmail) {
       throw new Error("Missing email address.");
     }
-    
+
     // 1. Determine sending account in priority order:
     // Priority 1: forcedAccount (user chose via popup)
     // Priority 2: Per-row Send From Account column
@@ -452,9 +509,6 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
     
     var defaultAccount = getConfigValue(config, "Default Send Account", "Account A").toString().trim();
     var selectedAccountName = forcedAccount || rowOverride || routedAccount || defaultAccount;
-    
-    // Resolve source-agnostic column mapping once for this call (Feature 1)
-    var mapping = resolveColumnMapping(sheet, false);
     
     // 2. Generate the personalized subject, opener, and closer using selected account
     var emailData = generatePersonalizedEmail(sheet, rowNumber, headersMap, config, selectedAccountName, mapping);
@@ -504,6 +558,7 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
       var draft = GmailApp.createDraft(recipient, finalSubject, finalBody, options);
       var msg = draft.send();
       statusVal = "Email Sent";
+      recordAccountSend(selectedAccountName); // Feature 5: increment daily send counter
       sheet.getRange(rowNumber, headersMap["Pipeline Stage"]).setValue("Sent");
       if (headersMap["Last Sent At"]) {
         sheet.getRange(rowNumber, headersMap["Last Sent At"]).setValue(new Date());
@@ -527,9 +582,9 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
         readySheet.appendRow([
           draftId,
           new Date(),
-          sheet.getRange(rowNumber, headersMap["Company"] ? headersMap["Company"] : 1).getValue(),
-          sheet.getRange(rowNumber, headersMap["First Name"] ? headersMap["First Name"] : 1).getValue(),
-          sheet.getRange(rowNumber, headersMap["Last Name"] ? headersMap["Last Name"] : 1).getValue(),
+          getFieldValue(sheet, rowNumber, headersMap, mapping, "Company", "company"),
+          getFieldValue(sheet, rowNumber, headersMap, mapping, "First Name", "first_name"),
+          getFieldValue(sheet, rowNumber, headersMap, mapping, "Last Name", "last_name"),
           originalEmail,        // always store the real recipient, not the test-redirected one
           selectedAccountName,
           scoreRange,           // the lead score (value read earlier)
@@ -1842,6 +1897,7 @@ function processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMo
       try {
         if (outreachMode.toLowerCase() === "send" && !DRY_RUN) {
           GmailApp.createDraft(recipient, finalSubject, finalBody, options).send();
+          recordAccountSend(selectedAccountName); // Feature 5: increment daily cap counter
         } else {
           GmailApp.createDraft(recipient, finalSubject, finalBody, options);
         }

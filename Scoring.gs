@@ -17,10 +17,10 @@
 function scoreSingleLead(sheet, rowNumber, headersMap, config, mapping) {
   try {
     // 1. Extract values for the row using generic mapping where possible
-    var company = getCanonical(sheet, rowNumber, mapping, "company");
-    var annualRevenue = getCanonical(sheet, rowNumber, mapping, "revenue");
-    var totalFunding = getCanonical(sheet, rowNumber, mapping, "funding_date"); // This maps to "Total Funding" in aliases? No, wait. "funding_date" maps to Last Raised At.
-    // Wait, the canonical fields are defined in Mapping.gs. Let me use headersMap as fallback for non-canonical fields.
+    var company = getCanonical(sheet, rowNumber, mapping, "company") ||
+                  (headersMap["Company"] ? sheet.getRange(rowNumber, headersMap["Company"]).getValue() : "");
+    var annualRevenue = getCanonical(sheet, rowNumber, mapping, "revenue") ||
+                        (headersMap["Annual Revenue"] ? sheet.getRange(rowNumber, headersMap["Annual Revenue"]).getValue() : "");
     var totalFunding = headersMap["Total Funding"] ? sheet.getRange(rowNumber, headersMap["Total Funding"]).getValue() : "";
     var latestFunding = headersMap["Latest Funding"] ? sheet.getRange(rowNumber, headersMap["Latest Funding"]).getValue() : "";
     var latestFundingAmount = headersMap["Latest Funding Amount"] ? sheet.getRange(rowNumber, headersMap["Latest Funding Amount"]).getValue() : "";
@@ -46,10 +46,18 @@ function scoreSingleLead(sheet, rowNumber, headersMap, config, mapping) {
       .replace(/{Hiring Status}/g, hiringStatus);
       
     // Handle new placeholders
+    var location = [city, country].filter(function(v) { return v && v.toString().trim() !== ""; }).join(", ");
     prompt = prompt.replace(/{Employees}/g, employees)
                    .replace(/{Technologies}/g, technologies)
-                   .replace(/{Location}/g, (city ? city + ", " : "") + country);
-      
+                   .replace(/{Location}/g, location);
+
+    // Feature 1: drop LEAD DATA lines whose value is empty so the model only
+    // ever sees fields that are actually populated for this row.
+    prompt = prompt.split("\n").filter(function(line) {
+      return !/^(Company|Annual Revenue|Total Funding|Latest Funding|Latest Funding Amount|Last Raised At|Hiring Status|Employees|Technologies|Location):\s*$/.test(line.trim());
+    }).join("\n");
+
+
     // 3. Determine primary and fallback providers
     var modelName = config.model || "gemini-2.0-flash";
     var isGemini = (modelName.indexOf("gemini") !== -1);

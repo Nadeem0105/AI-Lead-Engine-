@@ -19,7 +19,12 @@ var CANONICAL_FIELDS = {
   "first_name":     ["First Name", "Firstname", "Given Name", "Fname"],
   "last_name":      ["Last Name", "Lastname", "Surname", "Family Name", "Lname"],
   "full_name":      ["Full Name", "Contact Name", "Name", "Person Name"],
-  "industry":       ["Industry", "Sector", "Vertical", "Keywords", "Industry/Keywords"],
+  // NOTE: "Keywords" is intentionally NOT included here — Apollo Keywords are product/service
+  // tags (e.g. "it staffing", "bpo") and not the primary industry field. Including them caused
+  // IT outsourcing companies to be falsely flagged by the recruitment filter.
+  "industry":       ["Industry", "Sector", "Vertical", "Industry/Keywords"],
+  // Keywords gets its own canonical key for use in scoring prompts only.
+  "keywords":       ["Keywords", "Company Keywords", "Tags"],
   "revenue":        ["Annual Revenue", "Revenue", "Company Revenue", "Est. Revenue"],
   "funding_date":   ["Last Raised At", "Funding Date", "Latest Funding Date", "Last Funding Date"],
   "linkedin_url":   ["LinkedIn URL", "Linkedin", "LinkedIn Profile", "Person Linkedin Url", "Linkedin Url"],
@@ -175,6 +180,31 @@ function buildPresentFieldsBlock(sheet, rowNumber, mapping, fields) {
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * Reads a field value by literal header name first, then by canonical mapping.
+ * Lets Apollo-format sheets keep working while generic sheets (e.g. "Organization"
+ * instead of "Company") resolve through the alias layer (Feature 1).
+ *
+ * @param {Sheet} sheet
+ * @param {number} rowNumber
+ * @param {object} headersMap Result of getHeadersMap.
+ * @param {object} mapping Result of resolveColumnMapping (may be null).
+ * @param {string} literalHeader Exact header name to try first, e.g. "Company".
+ * @param {string} canonicalKey Canonical fallback key, e.g. "company" (may be null).
+ * @return {string} Trimmed string value, or "" if neither column exists.
+ */
+function getFieldValue(sheet, rowNumber, headersMap, mapping, literalHeader, canonicalKey) {
+  if (literalHeader && headersMap[literalHeader]) {
+    var val = sheet.getRange(rowNumber, headersMap[literalHeader]).getValue();
+    var str = (val === undefined || val === null) ? "" : val.toString().trim();
+    if (str !== "") return str;
+  }
+  if (canonicalKey && mapping) {
+    return getCanonical(sheet, rowNumber, mapping, canonicalKey);
+  }
+  return "";
 }
 
 /**

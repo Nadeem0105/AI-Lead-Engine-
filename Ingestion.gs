@@ -950,77 +950,115 @@ function enrichSelectedRows() {
     return;
   }
   
-  ui.showModelessDialog(HtmlService.createHtmlOutput("<p>Enriching " + toEnrich.length + " contacts...</p>").setWidth(300).setHeight(80), "Apollo Enrichment");
+  ui.showModelessDialog(HtmlService.createHtmlOutput("<p>Enriching " + toEnrich.length + " contacts in batches of 10...</p>").setWidth(300).setHeight(80), "Apollo Enrichment");
   
-  var matchPayload = { "details": toEnrich };
-  var matchOptions = {
-    "method": "post",
-    "contentType": "application/json",
-    "headers": {
-      "Cache-Control": "no-cache",
-      "X-Api-Key": apiKey
-    },
-    "payload": JSON.stringify(matchPayload),
-    "muteHttpExceptions": true
-  };
+  var BATCH_SIZE = 10;
+  var totalEnrichedCount = 0;
+  var totalNoMatchCount = 0;
+  var hasApiError = false;
   
-  var matchUrl = "https://api.apollo.io/api/v1/people/bulk_match";
-  var matchResponse = UrlFetchApp.fetch(matchUrl, matchOptions);
-  
-  if (matchResponse.getResponseCode() === 200) {
-    var matchResult = JSON.parse(matchResponse.getContentText());
-    var matches = matchResult.matches || [];
+  for (var batchStart = 0; batchStart < toEnrich.length; batchStart += BATCH_SIZE) {
+    var batchEnd = Math.min(batchStart + BATCH_SIZE, toEnrich.length);
+    var batchDetails = toEnrich.slice(batchStart, batchEnd);
+    var batchRows = rowIndexMap.slice(batchStart, batchEnd);
     
-    var enrichedCount = 0;
-    var noMatchCount = 0;
+    Logger.log("Enrichment batch " + (Math.floor(batchStart / BATCH_SIZE) + 1) + ": rows " + batchStart + " to " + (batchEnd - 1));
     
-    // Apollo returns matches in the same order as the input `details` array.
-    // Nulls or empty objects mean no match was found for that input.
-    for (var i = 0; i < rowIndexMap.length; i++) {
-      var r = rowIndexMap[i];
-      var match = matches[i]; // may be null/undefined if Apollo found nothing
+    var matchPayload = { "details": batchDetails };
+    var matchOptions = {
+      "method": "post",
+      "contentType": "application/json",
+      "headers": {
+        "Cache-Control": "no-cache",
+        "X-Api-Key": apiKey
+      },
+      "payload": JSON.stringify(matchPayload),
+      "muteHttpExceptions": true
+    };
+    
+    var matchUrl = "https://api.apollo.io/api/v1/people/bulk_match";
+    
+    try {
+      var matchResponse = UrlFetchApp.fetch(matchUrl, matchOptions);
       
-      if (!match || !match.id) {
-        // No match — tag the row so the user knows enrichment ran but found nothing
+      if (matchResponse.getResponseCode() !== 200) {
+        Logger.log("Apollo batch error (HTTP " + matchResponse.getResponseCode() + "): " + matchResponse.getContentText());
+        hasApiError = true;
+        // Tag all rows in this batch as error so user can retry them
+        for (var bi = 0; bi < batchRows.length; bi++) {
+          if (headersMap["Enrichment Status"]) {
+            leadsSheet.getRange(batchRows[bi], headersMap["Enrichment Status"]).setValue("API Error — Retry");
+          }
+        }
+        Utilities.sleep(2000);
+        continue; // move to next batch
+      }
+      
+      var matchResult = JSON.parse(matchResponse.getContentText());
+      var matches = matchResult.matches || [];
+      
+      // Apollo returns matches in the same order as the input `details` array.
+      // Nulls or empty objects mean no match was found for that input.
+      for (var i = 0; i < batchRows.length; i++) {
+        var r = batchRows[i];
+        var match = matches[i]; // may be null/undefined if Apollo found nothing
+        
+        if (!match || !match.id) {
+          // No match — tag the row so the user knows enrichment ran but found nothing
+          if (headersMap["Enrichment Status"]) {
+            leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("No Match");
+          }
+          totalNoMatchCount++;
+          continue;
+        }
+        
+        // Match found — write back missing fields
+        var existingEmail = getCanonical(leadsSheet, r, mapping, "email");
+        if (!existingEmail && match.email) {
+          if (headersMap["Email"]) leadsSheet.getRange(r, headersMap["Email"]).setValue(match.email);
+          if (headersMap["Email Status"]) leadsSheet.getRange(r, headersMap["Email Status"]).setValue(match.email_status || "Found (Apollo)");
+          totalEnrichedCount++;
+        }
+        
+        // Write mobile phone if missing
+        var mobile = (match.phone_numbers || []).filter(function(p){ return p.type === "mobile"; })[0];
+        if (mobile && headersMap["Mobile Phone"]) {
+          var existingPhone = leadsSheet.getRange(r, headersMap["Mobile Phone"]).getValue().toString().trim();
+          if (!existingPhone) {
+            leadsSheet.getRange(r, headersMap["Mobile Phone"]).setValue(mobile.sanitized_number || mobile.number);
+          }
+        }
+        
+        // Tag the row with enrichment source
         if (headersMap["Enrichment Status"]) {
-          leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("No Match");
-        }
-        noMatchCount++;
-        continue;
-      }
-      
-      // Match found — write back missing fields
-      var existingEmail = getCanonical(leadsSheet, r, mapping, "email");
-      if (!existingEmail && match.email) {
-        if (headersMap["Email"]) leadsSheet.getRange(r, headersMap["Email"]).setValue(match.email);
-        if (headersMap["Email Status"]) leadsSheet.getRange(r, headersMap["Email Status"]).setValue(match.email_status || "Found (Apollo)");
-        enrichedCount++;
-      }
-      
-      // Write mobile phone if missing
-      var mobile = (match.phone_numbers || []).filter(function(p){ return p.type === "mobile"; })[0];
-      if (mobile && headersMap["Mobile Phone"]) {
-        var existingPhone = leadsSheet.getRange(r, headersMap["Mobile Phone"]).getValue().toString().trim();
-        if (!existingPhone) {
-          leadsSheet.getRange(r, headersMap["Mobile Phone"]).setValue(mobile.sanitized_number || mobile.number);
+          leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("Apollo Enrichment");
         }
       }
       
-      // Tag the row with enrichment source
-      if (headersMap["Enrichment Status"]) {
-        leadsSheet.getRange(r, headersMap["Enrichment Status"]).setValue("Apollo Enrichment");
+      // Pause between batches to avoid rate-limiting
+      if (batchEnd < toEnrich.length) {
+        Utilities.sleep(1500);
+      }
+      
+    } catch (e) {
+      Logger.log("Enrichment batch exception: " + e.toString());
+      hasApiError = true;
+      for (var bi = 0; bi < batchRows.length; bi++) {
+        if (headersMap["Enrichment Status"]) {
+          leadsSheet.getRange(batchRows[bi], headersMap["Enrichment Status"]).setValue("API Error — Retry");
+        }
       }
     }
-    
-    ui.alert(
-      "Enrichment Complete",
-      "Apollo enrichment finished!\n\n" +
-      "- Rows submitted: " + rowIndexMap.length + "\n" +
-      "- Contacts enriched with email/phone: " + enrichedCount + "\n" +
-      "- No match found: " + noMatchCount,
-      ui.ButtonSet.OK
-    );
-  } else {
-    ui.alert("Apollo Enrichment Error", matchResponse.getContentText(), ui.ButtonSet.OK);
   }
+  
+  var alertMsg = "Apollo enrichment finished!\n\n" +
+    "- Rows submitted: " + toEnrich.length + "\n" +
+    "- Contacts enriched with email/phone: " + totalEnrichedCount + "\n" +
+    "- No match found: " + totalNoMatchCount;
+  
+  if (hasApiError) {
+    alertMsg += "\n\n⚠️ Some batches encountered API errors. Rows tagged 'API Error — Retry' can be re-selected and re-run.";
+  }
+  
+  ui.alert("Enrichment Complete", alertMsg, ui.ButtonSet.OK);
 }
