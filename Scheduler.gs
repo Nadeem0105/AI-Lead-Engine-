@@ -12,7 +12,18 @@ function prepareDailyQueue() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var leadsSheet = ss.getSheetByName("Leads");
     if (!leadsSheet) return;
-    
+
+    // 0. Refuse to run if any mailbox is still at the untouched bootstrap default quota
+    //    (a placeholder must never silently drive real sends).
+    if (typeof validateAccountConfigBeforeRun === "function") {
+      var quotaCheck = validateAccountConfigBeforeRun();
+      if (!quotaCheck.ok) {
+        Logger.log("prepareDailyQueue: aborted — account(s) at bootstrap default quota: " +
+                   quotaCheck.offenders.join(", ") + ". Set real per-mailbox quotas first.");
+        return;
+      }
+    }
+
     // 1. Reset quotas
     if (typeof resetDailyQuotasIfNeeded === "function") {
       resetDailyQuotasIfNeeded();

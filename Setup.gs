@@ -234,14 +234,27 @@ function setupSheetStructure() {
     if (!accountConfigSheet) {
       accountConfigSheet = ss.insertSheet("Account Config");
       accountConfigSheet.appendRow([
-        "Account", "Daily Quota", "Sent Today Count", "Last Reset Date"
+        "Account", "Daily Quota", "Sent Today Count", "Last Reset Date", "Quota Confirmed"
       ]);
       formatHeaderRow(accountConfigSheet);
       // Populate defaults from Account A..E if they exist
-      accountConfigSheet.appendRow(["Account A", 40, 0, ""]);
-      accountConfigSheet.appendRow(["Account B", 40, 0, ""]);
-      accountConfigSheet.autoResizeColumns(1, 4);
+      accountConfigSheet.appendRow(["Account A", 40, 0, "", false]);
+      accountConfigSheet.appendRow(["Account B", 40, 0, "", false]);
+      
+      // Add checkboxes to the Quota Confirmed column
+      accountConfigSheet.getRange(2, 5, 999, 1).insertCheckboxes();
+      
+      accountConfigSheet.autoResizeColumns(1, 5);
       Logger.log("Created 'Account Config' sheet.");
+    } else {
+       var configHeaders = accountConfigSheet.getRange(1, 1, 1, accountConfigSheet.getLastColumn()).getValues()[0];
+       if (configHeaders.indexOf("Quota Confirmed") === -1) {
+          var startCol = accountConfigSheet.getLastColumn() + 1;
+          accountConfigSheet.getRange(1, startCol, 1, 1).setValues([["Quota Confirmed"]]);
+          accountConfigSheet.getRange(2, startCol, accountConfigSheet.getMaxRows() - 1, 1).insertCheckboxes();
+          formatHeaderRow(accountConfigSheet);
+          Logger.log("Added 'Quota Confirmed' column to 'Account Config' sheet.");
+       }
     }
 
     ui.alert("Setup Complete", "All sheets and standard structures have been initialized.", ui.ButtonSet.OK);

@@ -20,9 +20,22 @@ var RESPONSE_STATUS = {
   BOUNCED: "bounced"
 };
 
-// Script Property keys backing the rolling bounce-rate metric.
+// Script Property key backing the bounce-rate metric. Stores a JSON array of timestamped
+// events — [ [epochMillis, bounceFlag], ... ] where bounceFlag is 1 (bounce) or 0
+// (delivered) — so the bounce rate can be computed over any rolling window after the fact.
+var BOUNCE_METRIC_EVENTS_KEY = "bounce_metric_events";
+// Legacy cumulative-counter keys (pre-rolling-window). Kept only so resetBounceMetric()
+// can clear any stale values left behind by the previous implementation.
 var BOUNCE_METRIC_SENT_KEY = "bounce_metric_sent_total";
 var BOUNCE_METRIC_BOUNCED_KEY = "bounce_metric_bounced_total";
+
+// Default rolling window (days) over which getBounceRate() is computed.
+var BOUNCE_METRIC_WINDOW_DAYS = 7;
+// How much history to retain on disk. Kept larger than the active window so the window can
+// be widened later (e.g. to 30 days) without having discarded the events it would need.
+var BOUNCE_METRIC_RETENTION_DAYS = 90;
+// One day in milliseconds.
+var MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
  * Classifies a single inbound thread message for a lead and records the outcome.
@@ -240,48 +253,106 @@ function getRawContentSafe_(threadMessage) {
 }
 
 /**
- * Updates the rolling bounce-rate metric stored in Script Properties.
- * Tracks cumulative delivered + bounced counts and logs the current rate.
+ * Records one classified message as a timestamped event in the bounce-metric log, prunes
+ * events older than the retention horizon, and returns the current rolling bounce rate.
  *
- * NOTE: window semantics (daily/weekly/monthly) are pending manager confirmation
- * (open question #3). This implements an all-time cumulative counter; callers can
- * reset it on whatever cadence is chosen via resetBounceMetric().
+ * Storing per-event timestamps (rather than a running counter) means the reporting window
+ * is a pure read-time decision: nothing here bakes in a particular cadence.
+ *
+ * // TODO(confirm-with-manager): bounce rate currently computed on a rolling
+ * // 7-day window. Manager may want weekly/monthly/all-time instead — the
+ * // timestamp-log storage above supports any window without a schema change,
+ * // only the windowDays argument needs to change once confirmed.
  *
  * @param {boolean} isBounce True if the classified message was a bounce.
- * @return {number} The current bounce rate as a fraction (0-1).
+ * @return {number} The current bounce rate over the default window as a fraction (0-1).
  */
 function updateBounceMetric_(isBounce) {
   var props = PropertiesService.getScriptProperties();
-  var sent = parseInt(props.getProperty(BOUNCE_METRIC_SENT_KEY) || "0");
-  var bounced = parseInt(props.getProperty(BOUNCE_METRIC_BOUNCED_KEY) || "0");
+  var nowMs = new Date().getTime();
 
-  sent += 1;
-  if (isBounce) bounced += 1;
+  var events = readBounceEvents_(props);
+  events.push([nowMs, isBounce ? 1 : 0]);
+  events = pruneBounceEvents_(events, nowMs, BOUNCE_METRIC_RETENTION_DAYS);
+  props.setProperty(BOUNCE_METRIC_EVENTS_KEY, JSON.stringify(events));
 
-  props.setProperty(BOUNCE_METRIC_SENT_KEY, sent.toString());
-  props.setProperty(BOUNCE_METRIC_BOUNCED_KEY, bounced.toString());
-
-  var rate = sent > 0 ? (bounced / sent) : 0;
-  Logger.log("Bounce metric updated: " + bounced + "/" + sent + " = " + (rate * 100).toFixed(2) + "%");
+  var rate = computeBounceRate_(events, nowMs, BOUNCE_METRIC_WINDOW_DAYS);
+  var windowStats = countBounceEvents_(events, nowMs, BOUNCE_METRIC_WINDOW_DAYS);
+  Logger.log("Bounce metric updated (" + BOUNCE_METRIC_WINDOW_DAYS + "-day window): " +
+             windowStats.bounced + "/" + windowStats.total + " = " + (rate * 100).toFixed(2) + "%");
   return rate;
 }
 
 /**
- * Returns the current rolling bounce rate as a fraction (0-1).
+ * Returns the bounce rate as a fraction (0-1) computed over a rolling window.
+ * @param {number} [windowDays] Window size in days (defaults to BOUNCE_METRIC_WINDOW_DAYS).
  */
-function getBounceRate() {
+function getBounceRate(windowDays) {
   var props = PropertiesService.getScriptProperties();
-  var sent = parseInt(props.getProperty(BOUNCE_METRIC_SENT_KEY) || "0");
-  var bounced = parseInt(props.getProperty(BOUNCE_METRIC_BOUNCED_KEY) || "0");
-  return sent > 0 ? (bounced / sent) : 0;
+  var nowMs = new Date().getTime();
+  var events = readBounceEvents_(props);
+  var w = (windowDays === undefined || windowDays === null) ? BOUNCE_METRIC_WINDOW_DAYS : windowDays;
+  return computeBounceRate_(events, nowMs, w);
 }
 
 /**
- * Resets the rolling bounce-rate metric window (call on the chosen cadence).
+ * Reads and parses the stored bounce-event log. Returns [] on any missing/corrupt data.
+ */
+function readBounceEvents_(props) {
+  var raw = props.getProperty(BOUNCE_METRIC_EVENTS_KEY);
+  if (!raw) return [];
+  try {
+    var arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    Logger.log("readBounceEvents_: could not parse event log, resetting: " + e.toString());
+    return [];
+  }
+}
+
+/**
+ * Drops events older than retentionDays before the given reference time.
+ */
+function pruneBounceEvents_(events, nowMs, retentionDays) {
+  var cutoff = nowMs - retentionDays * MS_PER_DAY;
+  var kept = [];
+  for (var i = 0; i < events.length; i++) {
+    if (events[i] && events[i][0] >= cutoff) kept.push(events[i]);
+  }
+  return kept;
+}
+
+/**
+ * Counts { total, bounced } for events falling within windowDays of the reference time.
+ */
+function countBounceEvents_(events, nowMs, windowDays) {
+  var cutoff = nowMs - windowDays * MS_PER_DAY;
+  var total = 0, bounced = 0;
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    if (!ev || ev[0] < cutoff) continue;
+    total++;
+    if (ev[1] === 1) bounced++;
+  }
+  return { total: total, bounced: bounced };
+}
+
+/**
+ * Computes the bounce rate (0-1) over a rolling window from a stored event log.
+ */
+function computeBounceRate_(events, nowMs, windowDays) {
+  var stats = countBounceEvents_(events, nowMs, windowDays);
+  return stats.total > 0 ? (stats.bounced / stats.total) : 0;
+}
+
+/**
+ * Clears the bounce-metric event log (and any legacy cumulative counters). Rarely needed
+ * now that the rolling window ages events out on its own, but kept for a hard reset.
  */
 function resetBounceMetric() {
   var props = PropertiesService.getScriptProperties();
-  props.setProperty(BOUNCE_METRIC_SENT_KEY, "0");
-  props.setProperty(BOUNCE_METRIC_BOUNCED_KEY, "0");
-  Logger.log("Bounce metric window reset.");
+  props.deleteProperty(BOUNCE_METRIC_EVENTS_KEY);
+  props.deleteProperty(BOUNCE_METRIC_SENT_KEY);
+  props.deleteProperty(BOUNCE_METRIC_BOUNCED_KEY);
+  Logger.log("Bounce metric event log reset.");
 }

@@ -18,6 +18,13 @@ var ACCOUNT_CONFIG_SHEET_NAME = "Account Config";
 // self-heal (recreate the sheet) even before Setup.gs has been run.
 var ACCOUNT_CONFIG_HEADERS = ["Account", "Daily Quota", "Sent Today Count", "Last Reset Date"];
 
+// Quota an account is seeded with when the Account Config sheet is first bootstrapped.
+// It is intentionally a placeholder: a per-mailbox Daily Quota must be set manually
+// (based on mailbox age/warmup) before the daily run is allowed to proceed. Any account
+// left sitting at exactly this value is treated as "unconfigured" by
+// validateAccountConfigBeforeRun().
+var BOOTSTRAP_DEFAULT_QUOTA = 40;
+
 /**
  * Returns the Account Config sheet, creating it with default headers + one row per
  * configured account if it does not exist yet. This keeps QuotaManager usable even
@@ -35,11 +42,11 @@ function getAccountConfigSheet_() {
   sheet.appendRow(ACCOUNT_CONFIG_HEADERS);
   sheet.getRange(1, 1, 1, ACCOUNT_CONFIG_HEADERS.length).setFontWeight("bold").setBackground("#f3f4f6");
 
-  var defaultQuota = 40;
+  var defaultQuota = BOOTSTRAP_DEFAULT_QUOTA;
   var accounts = [];
   try {
     var config = getConfig();
-    defaultQuota = parseInt(getConfigValue(config, "Per Account Daily Cap", "40")) || 40;
+    defaultQuota = parseInt(getConfigValue(config, "Per Account Daily Cap", BOOTSTRAP_DEFAULT_QUOTA.toString())) || BOOTSTRAP_DEFAULT_QUOTA;
     var pools = [
       getConfigValue(config, "Score Band High Accounts", ""),
       getConfigValue(config, "Score Band Mid Accounts", ""),
@@ -237,4 +244,56 @@ function recordSend(account) {
     sheet.getRange(row, resetCol + 1).setValue(quotaTodayString_());
   }
   return updated;
+}
+
+/**
+ * Startup guard for the daily run. Scans the Account Config sheet and reports any account
+ * whose Daily Quota is still sitting at the untouched BOOTSTRAP_DEFAULT_QUOTA placeholder —
+ * i.e. a mailbox that was auto-seeded but never given a real, warmup-appropriate quota.
+ *
+ * prepareDailyQueue() should call this first and refuse to run when any offender is found,
+ * so a placeholder quota can never silently drive real sends.
+ *
+ * CAVEAT: this cannot distinguish an untouched placeholder from a mailbox a human
+ * deliberately set to BOOTSTRAP_DEFAULT_QUOTA. If 40 is a legitimate manual value for a
+ * mailbox, nudge it (e.g. set then reset) or change BOOTSTRAP_DEFAULT_QUOTA to a value no
+ * real mailbox would use.
+ *
+ * @return {object} { ok: boolean, offenders: string[] } — ok=true means every account has
+ *                   a quota that differs from the bootstrap default.
+ */
+function validateAccountConfigBeforeRun() {
+  var sheet = getAccountConfigSheet_();
+  var cols = accountConfigColMap_(sheet);
+  var accountCol = cols["Account"];
+  var quotaCol = cols["Daily Quota"];
+  var lastRow = sheet.getLastRow();
+  var offenders = [];
+
+  if (accountCol === undefined || quotaCol === undefined) {
+    Logger.log("validateAccountConfigBeforeRun: Account Config missing required columns; allowing run.");
+    return { ok: true, offenders: offenders };
+  }
+  if (lastRow <= 1) {
+    Logger.log("validateAccountConfigBeforeRun: no accounts configured yet; allowing run.");
+    return { ok: true, offenders: offenders };
+  }
+
+  var data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var account = data[i][accountCol].toString().trim();
+    if (!account) continue;
+    var quota = parseInt(data[i][quotaCol]);
+    if (!isNaN(quota) && quota === BOOTSTRAP_DEFAULT_QUOTA) {
+      offenders.push(account);
+    }
+  }
+
+  var ok = offenders.length === 0;
+  if (!ok) {
+    Logger.log("validateAccountConfigBeforeRun: REFUSING to run — account(s) still at the bootstrap " +
+               "default quota (" + BOOTSTRAP_DEFAULT_QUOTA + "): " + offenders.join(", ") +
+               ". Set a real per-mailbox Daily Quota in the '" + ACCOUNT_CONFIG_SHEET_NAME + "' sheet first.");
+  }
+  return { ok: ok, offenders: offenders };
 }

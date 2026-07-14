@@ -213,6 +213,10 @@ function processFollowupQueue() {
  * If a lead is out-of-office and hasn't had its 10-day touch scheduled yet, cancel the
  * pending 3-day (Followup 1) and set Followup 2 Due Date to Send Date + 10 days.
  */
+// TODO(confirm-with-manager): OOO carve-out currently reschedules followup 2
+// from ORIGINAL SEND DATE + 10 days. Alternative interpretation: from the
+// followup-1 DUE date + 10 (same value today since due date = send + 3,
+// but would diverge if that offset ever changes). Confirm which the manager means.
 function handleOooReschedule_(leadsSheet, r, headersMap) {
   if (!headersMap["Followup 2 Due Date"]) return;
 

@@ -226,13 +226,23 @@ function assignSendPriority(lead, config) {
  *      queue for the day.
  *   3. "blocked" leads are dropped entirely.
  *
- * Given H verified leads, the max catch-alls C that keeps C/(H+C) <= 20% is
- *   C = floor( H * ratio / (1 - ratio) )   ->  floor(H * 0.25) for ratio = 0.20.
+ * Given H verified leads, the max catch-alls C that keeps catch-alls at CATCH_ALL_QUEUE_RATIO
+ * (20%) of the FINAL queue is found from C/(H+C) <= ratio, i.e.
+ *   C = floor( H * ratio / (1 - ratio) ).
+ * For ratio = 0.20 this evaluates to floor(H * 0.25) — the 0.25 is derived from the 20%
+ * rule (0.20 / 0.80), NOT a second hardcoded ratio. Using floor(H * 0.20) here would be a
+ * bug: it would cap catch-alls at ~16.7% of the queue, not 20%.
  *
  * @param {Array<object>} leads Array of lead objects (each with email and optional score).
  * @param {object} [config]
  * @return {Array<object>} The ordered send queue.
  */
+// TODO(confirm-with-manager): the 20% catch-all cap is currently applied GLOBALLY across the
+// whole day's queue. This function has no per-account context — the sending account is chosen
+// later, at send time, in Scheduler.processSendWindow via selectAccountByScore. If the manager
+// wants the cap enforced PER ACCOUNT instead, this needs restructuring so the queue is grouped
+// by account before the cap is applied — flag before relying on this in a compliance-sensitive
+// context. (Note: the audit brief assumed this was already per-account; it is not.)
 function buildPrioritizedQueue(leads, config) {
   config = config || safeGetConfig_();
   var threshold = getCatchAllScoreThreshold_(config);
