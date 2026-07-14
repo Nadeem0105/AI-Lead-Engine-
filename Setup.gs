@@ -21,7 +21,8 @@ var APOLLO_COLUMNS = [
 var CUSTOM_COLUMNS = [
   "Score", "Score Reason", "Validation Status", "Validation Reason", "Outreach Status", "Hiring Status",
   "Company Validation Status", "Company Validation Reason", "Research Status", "Pipeline Stage", "Last Sent At", "Replied", "Follow-up Status", "Thread Id", "Send From Account",
-  "Raw Name Backup", "Score Source", "Enrichment Status"
+  "Raw Name Backup", "Score Source", "Enrichment Status",
+  "ZB Status", "ZB Score", "Send Priority", "Response Status", "Bounce Type", "Followup 1 Sent Date", "Followup 2 Sent Date", "Followup 1 Due Date", "Followup 2 Due Date", "Followup Cancelled", "Send Date"
 ];
 
 // Define default config values
@@ -226,6 +227,21 @@ function setupSheetStructure() {
       // Add checkboxes to the Ready for Send column
       readySheet.getRange(2, 12, 999, 1).insertCheckboxes();
       Logger.log("Created 'Ready to Send' sheet.");
+    }
+
+    // 7. Setup "Account Config" Sheet (Email Ops Upgrade)
+    var accountConfigSheet = ss.getSheetByName("Account Config");
+    if (!accountConfigSheet) {
+      accountConfigSheet = ss.insertSheet("Account Config");
+      accountConfigSheet.appendRow([
+        "Account", "Daily Quota", "Sent Today Count", "Last Reset Date"
+      ]);
+      formatHeaderRow(accountConfigSheet);
+      // Populate defaults from Account A..E if they exist
+      accountConfigSheet.appendRow(["Account A", 40, 0, ""]);
+      accountConfigSheet.appendRow(["Account B", 40, 0, ""]);
+      accountConfigSheet.autoResizeColumns(1, 4);
+      Logger.log("Created 'Account Config' sheet.");
     }
 
     ui.alert("Setup Complete", "All sheets and standard structures have been initialized.", ui.ButtonSet.OK);
@@ -730,6 +746,36 @@ function applyLeadDropdownValidations(leadsSheet) {
     "Pending",
     "Done",
     "Skipped"
+  ]);
+
+  // --- Email Ops Upgrade Enums ---
+  applyDropdown("ZB Status", [
+    "verified",
+    "catch-all",
+    "invalid",
+    "unknown",
+    "spamtrap",
+    "abuse",
+    "do_not_mail"
+  ]);
+  
+  applyDropdown("Send Priority", [
+    "high",
+    "capped",
+    "blocked"
+  ]);
+  
+  applyDropdown("Response Status", [
+    "none",
+    "replied",
+    "bounced",
+    "out_of_office"
+  ]);
+  
+  applyDropdown("Bounce Type", [
+    "none",
+    "hard",
+    "soft"
   ]);
 
   // --- Column: Score (Feature 3) ---
