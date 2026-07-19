@@ -10,12 +10,22 @@
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu("Lead Engine")
-    .addItem("Setup Sheets", "setupSheetStructure")
-    .addItem("Upgrade to Dual Accounts", "upgradeToDualAccount")
-    .addItem("Apply Column Dropdowns", "applyLeadDropdownValidations")
-    .addItem("Highlight Required Columns", "applyHeaderFormattingMenu")
+  
+    // GROUP 1: Setup & Configuration
+    .addSubMenu(ui.createMenu("⚙️ Setup & Configuration")
+      .addItem("Setup Sheets", "setupSheetStructure")
+      .addItem("Apply Column Dropdowns", "applyLeadDropdownValidations")
+      .addSeparator()
+      .addItem("Authorize Mailboxes (OAuth2)", "authorizeMailboxesUI")
+      .addSubMenu(ui.createMenu("Assign Send Account")
+        .addItem("Assign to Account A (Selected rows)", "setAccountAForSelected")
+        .addItem("Assign to Account B (Selected rows)", "setAccountBForSelected")
+      )
+    )
     .addSeparator()
-    .addSubMenu(ui.createMenu("Ingest Leads")
+    
+    // GROUP 2: Ingestion & Enrichment
+    .addSubMenu(ui.createMenu("📥 Ingest Leads")
       .addItem("Apollo Ingest (Sync Saved)", "runLeadIngestionPipeline")
       .addItem("LinkedIn X-Ray Ingest (Google CSE)", "runLinkedInXRayIngestionPipeline")
       .addItem("GitHub Search Ingest", "runGitHubIngestionPipeline")
@@ -24,34 +34,50 @@ function onOpen() {
       .addItem("Manual Apollo Enrichment (Selected)", "enrichSelectedRows")
     )
     .addSeparator()
-    .addItem("Score new leads", "runScoringOnlyMenu")
-    .addItem("Process Leads (End-to-End)", "runFullPipelineMenu")
+    
+    // GROUP 3: AI Scoring
+    .addSubMenu(ui.createMenu("🧠 AI Scoring & Pipeline")
+      .addItem("Score new leads", "runScoringOnlyMenu")
+      .addItem("Process Leads (End-to-End)", "runFullPipelineMenu")
+    )
     .addSeparator()
-    .addItem("Test Outreach Tone (3 Samples)", "runOutreachTest")
-    .addItem("Preview drafts for selected rows", "previewSelectedDrafts")
-    .addItem("Generate outreach drafts (All Ready)", "runOutreachPipeline")
-    .addItem("Generate drafts for selected rows", "generateSelectedDrafts")
-    .addItem("Send all generated drafts", "sendDraftsFromPipeline")
-    .addItem("Scan replies & send follow-ups", "detectRepliesAndFollowUp")
-    .addItem("Preview follow-up (selected rows)", "previewFollowUpSelected")
-    .addItem("Send follow-up (selected rows)", "sendFollowUpForSelected")
-    .addItem("Send follow-up (all eligible)", "sendFollowUpForAll")
+    
+    // GROUP 4: Outreach & Drafts
+    .addSubMenu(ui.createMenu("📝 Outreach & Drafts")
+      .addItem("Generate outreach drafts (All Ready)", "runOutreachPipeline")
+      .addItem("Generate drafts for selected rows", "generateSelectedDrafts")
+      .addItem("Verify Drafts (AI QA)", "verifyDraftsInReadyTab")
+      .addItem("Push Approved Drafts to Gmail", "pushReadyDraftsMenu")
+      .addItem("Send all Gmail Drafts", "sendDraftsFromPipeline")
+    )
     .addSeparator()
-    .addSubMenu(ui.createMenu("Automation Triggers")
-      .addItem("Start Hourly Sending", "setupOutreachTrigger")
-      .addItem("Stop Sending", "deactivateOutreachTrigger")
-      .addItem("Send Now (Manual)", "runOutreachPipelineManualBatch")
+    
+    // GROUP 5: Daily Email Ops
+    .addSubMenu(ui.createMenu("🚀 Email Ops (Daily Workflow)")
+      .addItem("1. Prepare Daily Queue (Validate & Sort)", "prepareDailyQueue")
+      .addItem("2. Forecast Daily Quota", "updateDailyForecast")
+      .addSeparator()
+      .addItem("📅 Set Daily Forecast Trigger (9 AM)", "setupDailyForecastTrigger")
+      .addItem("❌ Remove Daily Forecast Trigger", "removeDailyForecastTrigger")
+      .addSeparator()
+      .addItem("3. Process Follow-ups", "processFollowupQueue")
+      .addItem("4. Scan Inbox for Responses", "processInboundResponses")
+    )
+    .addSeparator()
+    
+    // GROUP 6: Automation Triggers
+    .addSubMenu(ui.createMenu("⏱️ Automation Triggers")
+      .addItem("Start 1-Minute Drip Engine", "setupDripEngineTrigger")
+      .addItem("Stop Drip Engine", "deactivateDripEngineTrigger")
+      .addItem("Trigger Drip Engine Once", "runDripEngine")
       .addSeparator()
       .addItem("Start Daily Follow-ups", "setupFollowUpTrigger")
       .addItem("Stop Follow-ups", "deactivateFollowUpTrigger")
     )
-    .addSeparator()
-    .addSubMenu(ui.createMenu("Assign Send Account")
-      .addItem("Assign to Account A (Selected rows)", "setAccountAForSelected")
-      .addItem("Assign to Account B (Selected rows)", "setAccountBForSelected")
-    )
     .addToUi();
 }
+
+
 
 /**
  * Loads configuration parameters from the "Config" sheet.

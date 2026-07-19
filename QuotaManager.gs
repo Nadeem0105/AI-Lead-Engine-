@@ -195,7 +195,14 @@ function getRemainingQuota(account) {
 
   var quota = parseInt(sheet.getRange(row, quotaCol + 1).getValue()) || 0;
   var sent = parseInt(sheet.getRange(row, countCol + 1).getValue()) || 0;
-  var remaining = quota - sent;
+  
+  // Deduct follow-ups from the daily quota before allowing new emails.
+  var pendingFollowups = 0;
+  if (typeof getPendingFollowupsCount === 'function') {
+    pendingFollowups = getPendingFollowupsCount(account);
+  }
+  
+  var remaining = quota - sent - pendingFollowups;
   return remaining > 0 ? remaining : 0;
 }
 
@@ -296,4 +303,286 @@ function validateAccountConfigBeforeRun() {
                ". Set a real per-mailbox Daily Quota in the '" + ACCOUNT_CONFIG_SHEET_NAME + "' sheet first.");
   }
   return { ok: ok, offenders: offenders };
+}
+
+/**
+ * Calculates the pending follow-ups due today and updates the Daily Quota Forecast tab.
+ * Schema: Account | Account Daily Limit | Fresh Mails Sent Today | FU1 Due Today |
+ *         FU2 Due Today | Total Emails Due | Remaining Fresh Slots | Last Updated
+ */
+function updateDailyForecast() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var forecastSheet = ss.getSheetByName("Daily Quota Forecast");
+    if (!forecastSheet) {
+      if (typeof setupDailyForecastSheet_ === "function") setupDailyForecastSheet_(ss);
+      forecastSheet = ss.getSheetByName("Daily Quota Forecast");
+      if (!forecastSheet) { Logger.log("updateDailyForecast: cannot create sheet."); return; }
+    }
+    var leadsSheet = ss.getSheetByName("Leads");
+    if (!leadsSheet) return;
+    var headersMap = getHeadersMap(leadsSheet);
+    resetDailyQuotasIfNeeded();
+    var configSheet = getAccountConfigSheet_();
+    var configCols = accountConfigColMap_(configSheet);
+    var lastConfigRow = configSheet.getLastRow();
+    if (lastConfigRow <= 1) return;
+    var configData = configSheet.getRange(2, 1, lastConfigRow - 1, configSheet.getLastColumn()).getValues();
+    var accountsData = {};
+    for (var i = 0; i < configData.length; i++) {
+      var acc = configData[i][configCols["Account"]].toString().trim();
+      if (!acc) continue;
+      accountsData[acc] = {
+        dailyLimit: parseInt(configData[i][configCols["Daily Quota"]]) || 0,
+        sentToday: parseInt(configData[i][configCols["Sent Today Count"]]) || 0,
+        fu1Due: 0,
+        fu2Due: 0
+      };
+    }
+  
+    var lastRow = leadsSheet.getLastRow();
+    if (lastRow > 1) {
+      var data = leadsSheet.getRange(2, 1, lastRow - 1, leadsSheet.getLastColumn()).getValues();
+      var now = new Date();
+      for (var r = 0; r < data.length; r++) {
+        var rowData = data[r];
+        var replied = headersMap["Replied"] ? rowData[headersMap["Replied"] - 1].toString().trim() : "";
+        if (replied.toLowerCase() === "yes") continue;
+        var pipelineStage = headersMap["Pipeline Stage"] ? rowData[headersMap["Pipeline Stage"] - 1].toString().trim() : "";
+        var outreachStatus = headersMap["Outreach Status"] ? rowData[headersMap["Outreach Status"] - 1].toString().trim() : "";
+        var wasSent = (pipelineStage === "Sent" || pipelineStage === "Follow-up Sent" || outreachStatus === "Email Sent");
+        if (!wasSent) continue;
+        var cancelled = headersMap["Followup Cancelled"] ? rowData[headersMap["Followup Cancelled"] - 1] : false;
+        if (cancelled === true || cancelled.toString().toLowerCase() === "true") continue;
+        var account = "";
+        if (headersMap["Sent From Account"]) account = rowData[headersMap["Sent From Account"] - 1].toString().trim();
+        if (!account && headersMap["Send From Account"]) account = rowData[headersMap["Send From Account"] - 1].toString().trim();
+        if (!account) account = getConfigValue(getConfig(), "Default Send Account", "Account A").toString().trim();
+        if (!accountsData[account]) continue;
+        var f1Due = toDateOrNull_(headersMap["Followup 1 Due Date"] ? rowData[headersMap["Followup 1 Due Date"] - 1] : null);
+        var f1Sent = toDateOrNull_(headersMap["Followup 1 Sent Date"] ? rowData[headersMap["Followup 1 Sent Date"] - 1] : null);
+        var f2Due = toDateOrNull_(headersMap["Followup 2 Due Date"] ? rowData[headersMap["Followup 2 Due Date"] - 1] : null);
+        var f2Sent = toDateOrNull_(headersMap["Followup 2 Sent Date"] ? rowData[headersMap["Followup 2 Sent Date"] - 1] : null);
+        if (!f1Sent && f1Due && f1Due.getTime() <= now.getTime()) {
+          accountsData[account].fu1Due++;
+        } else if (f1Sent && !f2Sent && f2Due && f2Due.getTime() <= now.getTime()) {
+          accountsData[account].fu2Due++;
+        }
+      }
+    }
+  
+    // Clear old data rows (keep header)
+    var forecastLastRow = forecastSheet.getLastRow();
+    if (forecastLastRow > 1) {
+      forecastSheet.getRange(2, 1, forecastLastRow - 1, 8).clearContent();
+      forecastSheet.getRange(2, 1, forecastLastRow - 1, 8).setBackground("#f0f4f8");
+    }
+    var writeData = [];
+    var timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+    for (var accKey in accountsData) {
+      var info = accountsData[accKey];
+      var totalDue = info.fu1Due + info.fu2Due;
+      var remainingFreshSlots = info.dailyLimit - info.sentToday - totalDue;
+      if (remainingFreshSlots < 0) remainingFreshSlots = 0;
+      writeData.push([accKey, info.dailyLimit, info.sentToday, info.fu1Due, info.fu2Due, totalDue, remainingFreshSlots, timestamp]);
+    }
+    if (writeData.length > 0) {
+      forecastSheet.getRange(2, 1, writeData.length, 8).setValues(writeData);
+      for (var w = 0; w < writeData.length; w++) {
+        var rem = writeData[w][6];
+        var bg = rem > 10 ? "#c8e6c9" : (rem > 0 ? "#fff9c4" : "#ffcdd2");
+        forecastSheet.getRange(w + 2, 7).setBackground(bg);
+      }
+    }
+    Logger.log("updateDailyForecast completed successfully.");
+    SpreadsheetApp.getUi().alert("Forecast Updated ✅",
+      "Daily Quota Forecast refreshed. Check the 'Daily Quota Forecast' tab.",
+      SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error", e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+    Logger.log("Error in updateDailyForecast: " + e.toString());
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// HOURLY RATE LIMITER
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Checks if an account has hit its hourly sending limit for a given type.
+ * Automatically resets counters if the 1-hour window has expired.
+ * @param {string} account  e.g. "Account A"
+ * @param {string} type     "fresh" | "fu1" | "fu2"
+ * @return {{ok: boolean, message: string}}
+ */
+function checkHourlyLimit(account, type) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName("Hourly Rate Limits");
+    if (!sheet) return { ok: true, message: "" };
+
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var colMap = {};
+    headers.forEach(function(h, i) { colMap[h.toString().trim()] = i; });
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return { ok: true, message: "" };
+
+    var data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    for (var i = data.length - 1; i >= 0; i--) {
+      if (data[i][colMap["Account"]].toString().trim().toLowerCase() !== account.toLowerCase()) continue;
+
+      var rowNum = i + 2;
+      var now = new Date();
+      var maxColName = type === "fresh" ? "Max Emails / Hour" : (type === "fu1" ? "Max FU1 / Hour" : "Max FU2 / Hour");
+      var countColName = type === "fresh" ? "Sent This Hour" : (type === "fu1" ? "FU1 This Hour" : "FU2 This Hour");
+
+      var limit = parseInt(data[i][colMap[maxColName]]) || 0;
+      if (limit <= 0) return { ok: true, message: "" };
+
+      var current = 0;
+
+      // Reset window if expired (> 1 hour)
+      var windowRaw = data[i][colMap["Hour Window Start"]];
+      var windowStart = windowRaw ? new Date(windowRaw) : null;
+      if (!windowStart || (now.getTime() - windowStart.getTime()) >= 3600000) {
+        
+        // Rolling Ledger Logic: Append a new block of all accounts
+        var latestMap = {};
+        for (var j = data.length - 1; j >= 0; j--) {
+           var accName = data[j][colMap["Account"]].toString().trim();
+           if (accName && !latestMap[accName]) {
+             latestMap[accName] = data[j].slice(); // copy the array
+           }
+        }
+        
+        var accKeys = Object.keys(latestMap).sort();
+        var newRows = [];
+        var windowStartStr = Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+        
+        for (var k = 0; k < accKeys.length; k++) {
+           var rData = latestMap[accKeys[k]];
+           rData[colMap["Sent This Hour"]] = 0;
+           rData[colMap["FU1 This Hour"]] = 0;
+           rData[colMap["FU2 This Hour"]] = 0;
+           rData[colMap["Hour Window Start"]] = windowStartStr;
+           newRows.push(rData);
+        }
+        
+        var nextRow = sheet.getLastRow() + 1;
+        sheet.getRange(nextRow, 1, newRows.length, newRows[0].length).setValues(newRows);
+        
+        // Draw top border if it's a new day
+        if (windowStart && now.getDate() !== windowStart.getDate()) {
+          sheet.getRange(nextRow, 1, 1, newRows[0].length).setBorder(true, false, false, false, false, false, "#000000", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+        }
+        
+        Logger.log("Hourly window reset. Appended new block for all accounts.");
+        current = 0; // count is fresh for this new window
+      } else {
+        current = parseInt(data[i][colMap[countColName]]) || 0;
+      }
+
+      if (current >= limit) {
+        var label = type === "fresh" ? "fresh emails" : (type === "fu1" ? "Follow-up 1" : "Follow-up 2");
+        return {
+          ok: false,
+          message: "⏰ Hourly Limit Reached for " + account + "!\n\n" +
+                   "You have sent " + current + " " + label + " this hour (limit: " + limit + ").\n\n" +
+                   "The counter resets automatically after 1 hour from the first send.\n" +
+                   "Go to 'Hourly Rate Limits' tab to adjust your limits."
+        };
+      }
+      return { ok: true, message: "" };
+    }
+    return { ok: true, message: "" };
+  } catch (e) {
+    Logger.log("checkHourlyLimit error: " + e.toString());
+    return { ok: true, message: "" };
+  }
+}
+
+/**
+ * Increments the hourly send counter for an account/type. Call AFTER a successful send.
+ * @param {string} account e.g. "Account A"
+ * @param {string} type    "fresh" | "fu1" | "fu2"
+ */
+function recordHourlySend(account, type) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName("Hourly Rate Limits");
+    if (!sheet) return;
+
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var colMap = {};
+    headers.forEach(function(h, i) { colMap[h.toString().trim()] = i; });
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+    var data = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+
+    // Iterate backwards to find the latest row for this account in the rolling ledger
+    for (var i = data.length - 1; i >= 0; i--) {
+      if (data[i][colMap["Account"]].toString().trim().toLowerCase() !== account.toLowerCase()) continue;
+      var rowNum = i + 2;
+      var countColName = type === "fresh" ? "Sent This Hour" : (type === "fu1" ? "FU1 This Hour" : "FU2 This Hour");
+      var countSheetCol = colMap[countColName] + 1;
+      var windowSheetCol = colMap["Hour Window Start"] + 1;
+      if (!data[i][colMap["Hour Window Start"]]) {
+        sheet.getRange(rowNum, windowSheetCol).setValue(
+          Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      }
+      var current = parseInt(sheet.getRange(rowNum, countSheetCol).getValue()) || 0;
+      sheet.getRange(rowNum, countSheetCol).setValue(current + 1);
+      Logger.log("Hourly counter: " + account + "/" + type + " = " + (current + 1));
+      return;
+    }
+  } catch (e) {
+    Logger.log("recordHourlySend error: " + e.toString());
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DAILY 9 AM TRIGGER MANAGEMENT
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Creates a daily time-based trigger that runs updateDailyForecast at 9:00 AM.
+ * Safe to call multiple times — checks for existing trigger first.
+ */
+function setupDailyForecastTrigger() {
+  var ui = SpreadsheetApp.getUi();
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "updateDailyForecast") {
+      ui.alert("Already Active",
+        "A daily 9 AM forecast trigger is already running.\n\nTo change the time, remove it first.",
+        ui.ButtonSet.OK);
+      return;
+    }
+  }
+  ScriptApp.newTrigger("updateDailyForecast").timeBased().everyDays(1).atHour(9).create();
+  ui.alert("✅ Daily Trigger Set",
+    "The Daily Quota Forecast will auto-refresh every morning at 9:00 AM.",
+    ui.ButtonSet.OK);
+  Logger.log("Daily forecast trigger set for 9 AM.");
+}
+
+/**
+ * Removes all daily forecast triggers (updateDailyForecast).
+ */
+function removeDailyForecastTrigger() {
+  var ui = SpreadsheetApp.getUi();
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "updateDailyForecast") {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  ui.alert(removed > 0 ? "Trigger Removed" : "No Trigger Found",
+    removed > 0 ? "Daily Quota Forecast trigger removed." : "No active trigger found.",
+    ui.ButtonSet.OK);
+  Logger.log("removeDailyForecastTrigger: removed " + removed + " trigger(s).");
 }

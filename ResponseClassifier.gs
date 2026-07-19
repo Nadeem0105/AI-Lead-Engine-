@@ -38,6 +38,178 @@ var BOUNCE_METRIC_RETENTION_DAYS = 90;
 var MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 /**
+ * Inbox Scanner Loop. Walks the Leads sheet for active threads (Thread Id present,
+ * Response Status still empty), opens each Gmail thread, and classifies the first
+ * genuine inbound message — a prospect reply or a mailer-daemon/postmaster bounce.
+ *
+ * Messages sent by our OWN sending accounts (e.g. automated follow-ups from
+ * FollowupEngine.gs) are ignored so a follow-up we sent is never mistaken for a reply.
+ * Own-account detection resolves the lead's "Sent From Account" label to its configured
+ * email, and additionally excludes every "<Account> Email" configured in Config plus the
+ * active user, so multi-account setups are covered.
+ *
+ * Safe to run headless (from a menu item or a time-based trigger).
+ *
+ * @return {object} { scanned, classified, skippedNoInbound, errors } summary.
+ */
+function processInboundResponses() {
+  try {
+  
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var leadsSheet = ss.getSheetByName("Leads");
+  if (!leadsSheet) {
+    Logger.log("processInboundResponses: Leads sheet not found.");
+    return { error: "Leads sheet not found" };
+  }
+
+  var headersMap = getHeadersMap(leadsSheet);
+  if (!headersMap["Thread Id"]) {
+    Logger.log("processInboundResponses: 'Thread Id' column missing — run Setup Sheets.");
+    return { error: "'Thread Id' column missing" };
+  }
+
+  var config = safeGetConfig_();
+  var ownEmails = collectOwnAccountEmails_(config);
+
+  var lastRow = leadsSheet.getLastRow();
+  var summary = { scanned: 0, classified: 0, skippedNoInbound: 0, errors: 0 };
+  if (lastRow <= 1) return summary;
+
+  for (var r = 2; r <= lastRow; r++) {
+    var threadId = leadsSheet.getRange(r, headersMap["Thread Id"]).getValue().toString().trim();
+    if (!threadId) continue; // No conversation to inspect.
+
+    // Only look at threads not yet classified.
+    var responseStatus = headersMap["Response Status"]
+      ? leadsSheet.getRange(r, headersMap["Response Status"]).getValue().toString().trim()
+      : "";
+    if (responseStatus) continue;
+
+    summary.scanned++;
+
+    var leadEmail = headersMap["Email"] ? leadsSheet.getRange(r, headersMap["Email"]).getValue().toString().trim() : "";
+
+    // Resolve the account this lead was sent from, then its email, so replies from our
+    // own follow-up sends are not mistaken for prospect responses.
+    var accountEmail = "";
+    var rowOwnEmails = ownEmails.slice();
+    if (headersMap["Sent From Account"]) {
+      var accountLabel = leadsSheet.getRange(r, headersMap["Sent From Account"]).getValue().toString().trim();
+      if (accountLabel) {
+        accountEmail = getConfigValue(config, accountLabel + " Email", "").toString().trim().toLowerCase();
+        if (accountEmail && rowOwnEmails.indexOf(accountEmail) === -1) rowOwnEmails.push(accountEmail);
+      }
+    }
+    if (!accountEmail) return; // Skip if no email configured
+
+    var apiRes;
+    try {
+      apiRes = checkForReplyViaAPI_(accountEmail, threadId);
+    } catch (e) {
+      Logger.log("processInboundResponses: could not load thread API " + threadId + " (row " + r + "): " + e.toString());
+      summary.errors++;
+      continue;
+    }
+
+    if (apiRes.error) {
+      Logger.log("processInboundResponses: API returned error for thread " + threadId + ": " + apiRes.error);
+      summary.errors++;
+      continue;
+    }
+
+    if (apiRes.hasReply) {
+       var lead = { row: r, email: leadEmail };
+       lead.responseStatus = RESPONSE_STATUS.HUMAN_REPLY;
+       lead.replied = "Yes";
+       lead.followupCancelled = true;
+       persistResponseFields_(lead);
+       summary.classified++;
+       Logger.log("API: " + lead.email + " -> HUMAN REPLY.");
+    } else if (apiRes.isOOO) {
+       var lead = { row: r, email: leadEmail };
+       lead.responseStatus = RESPONSE_STATUS.OUT_OF_OFFICE;
+       lead.followupCancelled = false; 
+       persistResponseFields_(lead);
+       summary.classified++;
+       Logger.log("API: " + lead.email + " -> OUT OF OFFICE. 3-day follow-up cancelled, 10-day scheduled.");
+    } else {
+       summary.skippedNoInbound++;
+    }
+  } // end for loop
+
+  Logger.log("processInboundResponses complete: " + JSON.stringify(summary));
+  return summary;
+
+  } catch (e) {
+    Logger.log("Error in processInboundResponses: " + e.toString());
+    return { error: e.toString() };
+  }
+}
+
+/**
+ * Collects the set of lowercased email addresses that belong to us (our sending
+ * accounts + the active user), so inbound scanning can filter out our own messages.
+ *
+ * Pulls every Config key shaped like "<Account> Email" (e.g. "Account A Email").
+ */
+function collectOwnAccountEmails_(config) {
+  var emails = [];
+  var add = function (addr) {
+    var e = (addr || "").toString().trim().toLowerCase();
+    if (e && emails.indexOf(e) === -1) emails.push(e);
+  };
+
+  if (config) {
+    for (var key in config) {
+      if (!config.hasOwnProperty(key)) continue;
+      if (/ Email$/.test(key)) add(config[key]);
+    }
+  }
+
+  try {
+    // add(Session.getActiveUser().getEmail()); // Removed to avoid permission issues if not configured
+  } catch (e) {
+    // Active user email may be unavailable in some execution contexts — ignore.
+  }
+
+  return emails;
+}
+
+/**
+ * True if a message was sent by one of our own accounts. Matches the address parsed
+ * out of the message's From header against the provided own-email list.
+ */
+function isOwnAccountMessage_(message, ownEmails) {
+  if (!ownEmails || ownEmails.length === 0) return false;
+  var from = "";
+  try {
+    from = (message.getFrom() || "").toString().toLowerCase();
+  } catch (e) {
+    return false;
+  }
+  var sender = extractEmailAddress_(from);
+  for (var i = 0; i < ownEmails.length; i++) {
+    // Compare on the parsed address, falling back to a substring check on the raw header.
+    if ((sender && sender === ownEmails[i]) || from.indexOf(ownEmails[i]) !== -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extracts the bare email address from a From header such as
+ * '"Ayush" <sender1@company.com>' -> 'sender1@company.com'. Returns "" if none found.
+ */
+function extractEmailAddress_(from) {
+  if (!from) return "";
+  var angle = from.match(/<([^>]+)>/);
+  if (angle && angle[1]) return angle[1].trim().toLowerCase();
+  var bare = from.match(/[^\s<>@]+@[^\s<>@]+/);
+  return bare ? bare[0].trim().toLowerCase() : "";
+}
+
+/**
  * Classifies a single inbound thread message for a lead and records the outcome.
  *
  * @param {GmailMessage} threadMessage The incoming message to classify.
@@ -73,6 +245,8 @@ function classifyReply(threadMessage, lead) {
 
   // 3. Otherwise it is a genuine human reply.
   lead.responseStatus = RESPONSE_STATUS.HUMAN_REPLY;
+  lead.replied = "Yes";
+  lead.followupCancelled = true;
   persistResponseFields_(lead);
   Logger.log("classifyReply: " + (lead.email || "") + " -> HUMAN REPLY.");
   return RESPONSE_STATUS.HUMAN_REPLY;
@@ -99,10 +273,54 @@ function persistResponseFields_(lead) {
     if (lead.followupCancelled !== undefined && headersMap["Followup Cancelled"]) {
       leadsSheet.getRange(lead.row, headersMap["Followup Cancelled"]).setValue(lead.followupCancelled === true);
     }
+    if (lead.replied !== undefined && headersMap["Replied"]) {
+      leadsSheet.getRange(lead.row, headersMap["Replied"]).setValue(lead.replied);
+    }
+    
+    // Update Follow-up Status based on classification outcome.
+    // Human reply → "Replied" (stops all further follow-ups).
+    // Bounce       → "Bounced — Sequence Stopped".
+    if (headersMap["Follow-up Status"]) {
+      if (lead.responseStatus === RESPONSE_STATUS.HUMAN_REPLY) {
+        leadsSheet.getRange(lead.row, headersMap["Follow-up Status"]).setValue("Replied");
+        // Also mark lead as Replied in Outreach Status for visibility
+        if (headersMap["Outreach Status"]) {
+          leadsSheet.getRange(lead.row, headersMap["Outreach Status"]).setValue("Replied");
+        }
+        if (headersMap["Pipeline Stage"]) {
+          leadsSheet.getRange(lead.row, headersMap["Pipeline Stage"]).setValue("Replied");
+        }
+      } else if (lead.responseStatus === RESPONSE_STATUS.BOUNCED) {
+        leadsSheet.getRange(lead.row, headersMap["Follow-up Status"]).setValue("Bounced — Sequence Stopped");
+      }
+    }
+    
+    // HISTORICAL METRICS: Log Replied or Bounced
+    if (typeof logMetricEvent === "function" && typeof hasEventAlreadyLogged === "function") {
+      var eventTypeToLog = "";
+      if (lead.responseStatus === RESPONSE_STATUS.HUMAN_REPLY) {
+        eventTypeToLog = "Replied";
+      } else if (lead.responseStatus === RESPONSE_STATUS.BOUNCED && lead.bounceType === "hard") {
+        eventTypeToLog = "Bounced"; // Only log hard bounces to metrics
+      }
+      
+      if (eventTypeToLog) {
+        var account = headersMap["Send From Account"] ? leadsSheet.getRange(lead.row, headersMap["Send From Account"]).getValue().toString().trim() : "";
+        var threadId = headersMap["Thread Id"] ? leadsSheet.getRange(lead.row, headersMap["Thread Id"]).getValue().toString().trim() : "";
+        var originalSendDateStr = headersMap["Send Date"] ? leadsSheet.getRange(lead.row, headersMap["Send Date"]).getValue() : "";
+        var originalSendDate = originalSendDateStr ? new Date(originalSendDateStr) : new Date();
+        
+        if (threadId && !hasEventAlreadyLogged(threadId, eventTypeToLog)) {
+          logMetricEvent(account, eventTypeToLog, threadId, lead.email, originalSendDate);
+        }
+      }
+    }
+
   } catch (e) {
     Logger.log("ResponseClassifier.persistResponseFields_ error: " + e.toString());
   }
 }
+
 
 /**
  * Detects a delivery-failure (bounce) message and distinguishes hard vs soft bounces.
@@ -355,4 +573,67 @@ function resetBounceMetric() {
   props.deleteProperty(BOUNCE_METRIC_SENT_KEY);
   props.deleteProperty(BOUNCE_METRIC_BOUNCED_KEY);
   Logger.log("Bounce metric event log reset.");
+}
+
+function debugInboxScanner() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var leadsSheet = ss.getSheetByName("Leads");
+    var headersMap = getHeadersMap(leadsSheet);
+    var lastRow = leadsSheet.getLastRow();
+    var config = safeGetConfig_();
+    var ownEmails = collectOwnAccountEmails_(config);
+    var debugLog = "DEBUG INBOX SCANNER:\nOwn Emails: " + JSON.stringify(ownEmails) + "\n\n";
+
+    for (var r = 2; r <= lastRow; r++) {
+      var threadId = leadsSheet.getRange(r, headersMap["Thread Id"]).getValue().toString().trim();
+      var responseStatus = headersMap["Response Status"] ? leadsSheet.getRange(r, headersMap["Response Status"]).getValue().toString().trim() : "";
+      
+      if (!threadId) continue;
+      
+      debugLog += "Row " + r + " [Thread ID: " + threadId + "] [Status: " + (responseStatus||"BLANK") + "]\n";
+      
+      if (responseStatus) {
+         debugLog += "  -> Skipped: Already has Response Status.\n";
+         continue;
+      }
+      
+      try {
+        var thread = GmailApp.getThreadById(threadId);
+        if (!thread) {
+           debugLog += "  -> ERROR: Thread not found in Gmail.\n";
+           continue;
+        }
+        var messages = thread.getMessages();
+        debugLog += "  -> Messages length: " + messages.length + "\n";
+        
+        if (messages.length <= 1) {
+           debugLog += "  -> Skipped: No replies detected (length <= 1).\n";
+           continue;
+        }
+        
+        for (var m = 1; m < messages.length; m++) {
+          var from = messages[m].getFrom();
+          var isOwn = isOwnAccountMessage_(messages[m], ownEmails);
+          debugLog += "  -> Msg " + m + " From: " + from + " | isOwnAccount: " + isOwn + "\n";
+          if (!isOwn) {
+             debugLog += "  -> ATTEMPTING CLASSIFY REPLY...\n";
+             try {
+                var result = classifyReply(messages[m], { row: r, email: "test@test.com" });
+                debugLog += "  -> CLASSIFY RESULT: " + result + "\n";
+             } catch(err2) {
+                debugLog += "  -> CLASSIFY ERROR: " + err2.toString() + "\n";
+             }
+             break;
+          }
+        }
+      } catch (e) {
+        debugLog += "  -> THREAD ERROR: " + e.toString() + "\n";
+      }
+    }
+    
+    SpreadsheetApp.getUi().alert("Debug Output", debugLog, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch(err) {
+    SpreadsheetApp.getUi().alert("Error", err.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }

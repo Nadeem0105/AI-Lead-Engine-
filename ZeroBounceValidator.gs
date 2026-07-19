@@ -23,17 +23,26 @@ var CATCH_ALL_SCORE_THRESHOLD_DEFAULT = 7;
 var CATCH_ALL_QUEUE_RATIO = 0.20; // 20% rule (per day, across the whole queue)
 
 /**
- * Resolves the ZeroBounce API key from Script Properties (preferred) or Config.
- * @return {string} The key, or "" if none configured.
+ * Resolves the ZeroBounce API keys from Script Properties (preferred) or Config.
+ * Supports comma-separated keys for automatic rotation when credits are exhausted.
+ * @return {Array<string>} Array of keys, or empty array if none configured.
  */
-function getZeroBounceKey_(config) {
+function getZeroBounceKeys_(config) {
   var props = PropertiesService.getScriptProperties();
-  var key = props.getProperty("ZEROBOUNCE_API_KEY") || "";
-  if (!key && config) {
-    key = getConfigValue(config, "zeroBounceKey", "") ||
-          getConfigValue(config, "ZeroBounce API Key (Optional)", "");
+  var keysStr = props.getProperty("ZEROBOUNCE_API_KEYS") || props.getProperty("ZEROBOUNCE_API_KEY") || "";
+  
+  if (!keysStr && config) {
+    keysStr = getConfigValue(config, "zeroBounceKey", "") ||
+              getConfigValue(config, "ZeroBounce API Key (Optional)", "");
   }
-  return (key || "").toString().trim();
+  
+  if (!keysStr) return [];
+  
+  return keysStr.toString().split(',').map(function(k) {
+    return k.trim();
+  }).filter(function(k) {
+    return k.length > 0;
+  });
 }
 
 /**
@@ -78,35 +87,49 @@ function validateWithZeroBounce(lead, config) {
     return applyZbResult_(lead, result);
   }
 
-  var apiKey = getZeroBounceKey_(config);
-  if (!apiKey) {
-    Logger.log("ZeroBounceValidator: no ZEROBOUNCE_API_KEY configured; marking '" + email + "' as Unknown.");
+  var apiKeys = getZeroBounceKeys_(config);
+  if (apiKeys.length === 0) {
+    Logger.log("ZeroBounceValidator: no ZEROBOUNCE_API_KEYS configured; marking '" + email + "' as Unknown.");
     return applyZbResult_(lead, result);
   }
 
-  try {
-    var url = "https://api.zerobounce.net/v2/validate?api_key=" + encodeURIComponent(apiKey) +
-              "&email=" + encodeURIComponent(email) + "&ip_address=";
-    var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
-    if (response.getResponseCode() === 200) {
-      var obj = JSON.parse(response.getContentText());
-      var raw = (obj.status || "").toString().toLowerCase();
-      result.subStatus = (obj.sub_status || "").toString();
-      result.status = mapZeroBounceStatus_(raw);
+  for (var k = 0; k < apiKeys.length; k++) {
+    var apiKey = apiKeys[k];
+    try {
+      var url = "https://api.zerobounce.net/v2/validate?api_key=" + encodeURIComponent(apiKey) +
+                "&email=" + encodeURIComponent(email) + "&ip_address=";
+      var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
+      
+      if (response.getResponseCode() === 200) {
+        var obj = JSON.parse(response.getContentText());
+        
+        // ZeroBounce returns 200 OK but includes an "error" property when credits are exhausted
+        if (obj.error) {
+          Logger.log("ZeroBounceValidator: Key " + (k + 1) + " returned error: " + obj.error + ". Switching to next key...");
+          continue; // Try next key
+        }
+        
+        var raw = (obj.status || "").toString().toLowerCase();
+        result.subStatus = (obj.sub_status || "").toString();
+        result.status = mapZeroBounceStatus_(raw);
 
-      if (result.status === "Valid") {
-        result.score = 10;
-      } else if (result.status === "Catch-all" || result.status === "Unknown") {
-        // Query the AI scoring endpoint for a 0-10 confidence on the catch-all/unknown domain.
-        result.score = getZeroBounceAiScore_(email, apiKey);
+        if (result.status === "Valid") {
+          result.score = 10;
+        } else if (result.status === "Catch-all" || result.status === "Unknown") {
+          // Query the AI scoring endpoint for a 0-10 confidence on the catch-all/unknown domain.
+          result.score = getZeroBounceAiScore_(email, apiKeys, k); // Pass array and current index
+        } else {
+          result.score = 0; // Invalid / Spamtrap / Abuse / Do Not Mail
+        }
+        
+        // Successfully validated, break out of key rotation loop
+        break;
       } else {
-        result.score = 0; // Invalid / Spamtrap / Abuse / Do Not Mail
+        Logger.log("ZeroBounceValidator: HTTP " + response.getResponseCode() + " for '" + email + "' on Key " + (k + 1) + ". Switching to next key...");
       }
-    } else {
-      Logger.log("ZeroBounceValidator: HTTP " + response.getResponseCode() + " for '" + email + "'. Marking Unknown.");
+    } catch (e) {
+      Logger.log("ZeroBounceValidator.validateWithZeroBounce error for '" + email + "' on Key " + (k + 1) + ": " + e.toString());
     }
-  } catch (e) {
-    Logger.log("ZeroBounceValidator.validateWithZeroBounce error for '" + email + "': " + e.toString());
   }
 
   return applyZbResult_(lead, result);
@@ -152,22 +175,38 @@ function mapZeroBounceStatus_(raw) {
  * Calls the ZeroBounce AI scoring endpoint to grade a catch-all/unknown address 0-10.
  * ZeroBounce field names vary by plan, so several candidate fields are probed.
  * Returns 0 on any failure (fails safe — low score keeps risky mail out of the queue).
+ * Supports automatic key rotation.
  */
-function getZeroBounceAiScore_(email, apiKey) {
-  try {
-    var url = "https://api.zerobounce.net/v2/scoring?api_key=" + encodeURIComponent(apiKey) +
-              "&email=" + encodeURIComponent(email);
-    var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
-    if (response.getResponseCode() === 200) {
-      var obj = JSON.parse(response.getContentText());
-      var candidates = [obj.score, obj.quality_score, obj.ZeroBounceQualityScore, obj.ZBAIScore, obj.ai_score];
-      for (var i = 0; i < candidates.length; i++) {
-        var val = parseFloat(candidates[i]);
-        if (!isNaN(val)) return val;
+function getZeroBounceAiScore_(email, apiKeys, startIndex) {
+  for (var k = startIndex; k < apiKeys.length; k++) {
+    var apiKey = apiKeys[k];
+    try {
+      var url = "https://api.zerobounce.net/v2/scoring?api_key=" + encodeURIComponent(apiKey) +
+                "&email=" + encodeURIComponent(email);
+      var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
+      if (response.getResponseCode() === 200) {
+        var obj = JSON.parse(response.getContentText());
+        
+        // ZeroBounce returns 200 OK but includes an "error" property when credits are exhausted
+        if (obj.error) {
+          Logger.log("ZeroBounceValidator AI Scoring: Key " + (k + 1) + " returned error: " + obj.error + ". Switching to next key...");
+          continue; // Try next key
+        }
+        
+        var candidates = [obj.score, obj.quality_score, obj.ZeroBounceQualityScore, obj.ZBAIScore, obj.ai_score];
+        for (var i = 0; i < candidates.length; i++) {
+          var val = parseFloat(candidates[i]);
+          if (!isNaN(val)) return val;
+        }
+        
+        // If we got a valid response but couldn't find a score, break (don't retry on missing fields)
+        break;
+      } else {
+        Logger.log("ZeroBounceValidator AI Scoring: HTTP " + response.getResponseCode() + " for '" + email + "' on Key " + (k + 1) + ". Switching to next key...");
       }
+    } catch (e) {
+      Logger.log("ZeroBounceValidator.getZeroBounceAiScore_ error for '" + email + "' on Key " + (k + 1) + ": " + e.toString());
     }
-  } catch (e) {
-    Logger.log("ZeroBounceValidator.getZeroBounceAiScore_ error for '" + email + "': " + e.toString());
   }
   return 0;
 }
@@ -266,6 +305,7 @@ function buildPrioritizedQueue(leads, config) {
       } else {
         Logger.log("buildPrioritizedQueue: dropping catch-all '" + leadEmail_(lead) +
                    "' (ZB Score " + (isNaN(zbScore) ? "n/a" : zbScore) + " < threshold " + threshold + ").");
+        if (lead && typeof lead === "object") lead.sendPriority = "lowPriority";
       }
     }
     // "blocked" leads are silently excluded.
@@ -304,4 +344,73 @@ function leadSortScore_(lead) {
   if (!isNaN(s)) return s;
   var z = parseFloat(lead.zbScore);
   return isNaN(z) ? 0 : z;
+}
+
+/**
+ * Debug function to test the ZeroBounce API directly from the menu.
+ */
+function debugZeroBounce() {
+  var ui = SpreadsheetApp.getUi();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getActiveSheet();
+  var row = sheet.getActiveCell().getRow();
+  
+  if (row < 2) {
+    ui.alert("Error", "Please select a row with a lead first.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var headersMap = getHeadersMap(sheet);
+  if (!headersMap["Email"]) {
+    ui.alert("Error", "Could not find 'Email' column in this sheet.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var email = sheet.getRange(row, headersMap["Email"]).getValue().toString().trim();
+  if (!email) {
+    ui.alert("Error", "The email cell for this row is empty.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var apiKeys = getZeroBounceKeys_();
+  if (apiKeys.length === 0) {
+    ui.alert("Error", "No ZEROBOUNCE_API_KEYS found in Script Properties.", ui.ButtonSet.OK);
+    return;
+  }
+  
+  var results = "Testing Email: " + email + "\n\n";
+  
+  for (var k = 0; k < apiKeys.length; k++) {
+    var apiKey = apiKeys[k];
+    results += "--- Key " + (k + 1) + " ---\n";
+    results += "Key starts with: " + apiKey.substring(0, 5) + "...\n";
+    
+    try {
+      var url = "https://api.zerobounce.net/v2/validate?api_key=" + encodeURIComponent(apiKey) + "&email=" + encodeURIComponent(email) + "&ip_address=";
+      var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
+      var code = response.getResponseCode();
+      results += "Validation HTTP Status: " + code + "\n";
+      
+      var content = response.getContentText();
+      if (content.length > 300) {
+        content = content.substring(0, 300) + "... (truncated)";
+      }
+      results += "Validation Response:\n" + content + "\n";
+      
+      var obj = JSON.parse(response.getContentText());
+      if (obj.status === "catch-all" || obj.status === "unknown") {
+        var aiUrl = "https://api.zerobounce.net/v2/scoring?api_key=" + encodeURIComponent(apiKey) + "&email=" + encodeURIComponent(email);
+        var aiResponse = UrlFetchApp.fetch(aiUrl, { "muteHttpExceptions": true });
+        results += "AI Scoring HTTP Status: " + aiResponse.getResponseCode() + "\n";
+        results += "AI Scoring Response:\n" + aiResponse.getContentText() + "\n";
+      }
+      
+      results += "\n";
+      
+    } catch (e) {
+      results += "Error: " + e.toString() + "\n\n";
+    }
+  }
+  
+  ui.alert("ZeroBounce API Debug", results, ui.ButtonSet.OK);
 }

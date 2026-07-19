@@ -10,6 +10,7 @@
  */
 function runLeadIngestionPipeline() {
   var ui = SpreadsheetApp.getUi();
+  try {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var leadsSheet = ss.getSheetByName("Leads");
   
@@ -255,6 +256,9 @@ function runLeadIngestionPipeline() {
     logRun(0, 0, 0, errorMsg);
     ui.alert("Ingestion Exception", errorMsg, ui.ButtonSet.OK);
   }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Error', e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }
 
 /**
@@ -453,6 +457,7 @@ function mapApolloContactToRow(contact, headersMap) {
  */
 function runLinkedInXRayIngestionPipeline() {
   var ui = SpreadsheetApp.getUi();
+  try {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var leadsSheet = ss.getSheetByName("Leads");
   if (!leadsSheet) {
@@ -599,6 +604,9 @@ function runLinkedInXRayIngestionPipeline() {
   } catch(e) {
     ui.alert("LinkedIn Ingestion Error", e.toString(), ui.ButtonSet.OK);
   }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Error', e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }
 
 /**
@@ -607,6 +615,7 @@ function runLinkedInXRayIngestionPipeline() {
  */
 function runGitHubIngestionPipeline() {
   var ui = SpreadsheetApp.getUi();
+  try {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var leadsSheet = ss.getSheetByName("Leads");
   if (!leadsSheet) {
@@ -717,6 +726,9 @@ function runGitHubIngestionPipeline() {
   } catch(e) {
     ui.alert("GitHub Ingestion Error", e.toString(), ui.ButtonSet.OK);
   }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Error', e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }
 
 /**
@@ -725,6 +737,7 @@ function runGitHubIngestionPipeline() {
  */
 function runGoogleMapsIngestionPipeline() {
   var ui = SpreadsheetApp.getUi();
+  try {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var leadsSheet = ss.getSheetByName("Leads");
   if (!leadsSheet) {
@@ -831,6 +844,9 @@ function runGoogleMapsIngestionPipeline() {
   } catch(e) {
     ui.alert("Google Maps Ingestion Error", e.toString(), ui.ButtonSet.OK);
   }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Error', e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }
 
 /**
@@ -881,6 +897,7 @@ function splitNameWithAI(fullName) {
  */
 function enrichSelectedRows() {
   var ui = SpreadsheetApp.getUi();
+  try {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var leadsSheet = ss.getSheetByName("Leads");
   
@@ -1061,4 +1078,7 @@ function enrichSelectedRows() {
   }
   
   ui.alert("Enrichment Complete", alertMsg, ui.ButtonSet.OK);
+  } catch (e) {
+    SpreadsheetApp.getUi().alert('Error', e.toString(), SpreadsheetApp.getUi().ButtonSet.OK);
+  }
 }

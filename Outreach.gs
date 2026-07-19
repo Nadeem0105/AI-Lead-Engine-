@@ -5,7 +5,7 @@
 
 // Set to true during development/testing to prevent any real sends.
 // If true, even if mode is 'Send', it will only create drafts with "[TEST DRAFT]" prepended.
-var DRY_RUN = true; 
+var DRY_RUN = false; 
 
 /**
  * Main pipeline to process and generate outreach emails for qualified and validated leads.
@@ -92,11 +92,22 @@ function getAvailableAccountFromPool(pool, dailyCap, config) {
   for (var i = 0; i < pool.length; i++) {
     var acc = pool[i].toString().trim();
     if (!acc) continue;
-    var sentToday = getAccountSentToday(acc);
-    if (sentToday < dailyCap) {
+    
+    // Instead of just checking sentToday, we must use getRemainingQuota
+    // because getRemainingQuota properly deducts pending follow-ups from the daily cap.
+    var remainingSlots = 0;
+    if (typeof getRemainingQuota === "function") {
+      remainingSlots = getRemainingQuota(acc);
+    } else {
+      // Fallback if QuotaManager is missing (should never happen)
+      var sentToday = getAccountSentToday(acc);
+      remainingSlots = dailyCap - sentToday;
+    }
+    
+    if (remainingSlots > 0) {
       availableAccounts.push(acc);
     } else {
-      Logger.log("Account '" + acc + "' at daily cap (" + sentToday + "/" + dailyCap + "). Skipping.");
+      Logger.log("Account '" + acc + "' has no remaining fresh slots (cap hit or reserved for follow-ups). Skipping.");
     }
   }
   if (availableAccounts.length === 0) return null;
@@ -237,7 +248,38 @@ function processOutreachInternal(isHourly, selectedOnly, isManualBatch) {
   var testRecipient = getConfigValue(config, "Test Email Recipient", "").toString().trim();
   var batchLimit = parseInt(getConfigValue(config, "Emails Per Run", "10")) || 10;
   var senderSource = getConfigValue(config, "Sender Source", "MainSheet").toString().trim();
-  
+
+  // ── STAGING MODE ──────────────────────────────────────────────────────────
+  // When Staging Mode = true: emails go to REAL lead addresses, no [TEST] prefix,
+  // outreach mode is forced to Draft, and batch size is capped.
+  var stagingMode = getConfigValue(config, "Staging Mode", "false").toString().trim().toLowerCase() === "true";
+  if (stagingMode) {
+    outreachMode   = "Draft"; // Force Draft so nothing auto-sends
+    batchLimit     = parseInt(getConfigValue(config, "Staging Batch Limit", "3")) || 3;
+    
+    var alertTitle = "⚡ Staging Mode Active";
+    var alertMsg = "The engine is running in STAGING MODE.\n\n";
+    
+    if (testRecipient) {
+      Logger.log("STAGING MODE active: Draft forced, batch capped at " + batchLimit + ". Using TEST RECIPIENT.");
+      alertMsg += "⚠️ Emails will go to your TEST RECIPIENT: " + testRecipient + "\n";
+      alertMsg += "✅ No [TEST] prefix on subject lines (Clean Test)\n";
+    } else {
+      Logger.log("STAGING MODE active: real recipients, Draft forced, batch capped at " + batchLimit);
+      alertMsg += "✅ Emails will go to REAL lead addresses\n";
+      alertMsg += "✅ No [TEST] prefix on subject lines\n";
+    }
+    
+    alertMsg += "✅ Drafts will appear in Gmail (NOT auto-sent)\n";
+    alertMsg += "✅ Batch is capped at " + batchLimit + " leads\n\n";
+    alertMsg += "Review the Gmail drafts folder to see exactly what the leads would receive.";
+    
+    if (!isHourly) {
+      SpreadsheetApp.getUi().alert(alertTitle, alertMsg, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   if (isHourly && senderSource === "ReadyTab") {
     return processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMode);
   }
@@ -526,7 +568,7 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
     var subject = emailData.subject;
     var emailBody = emailData.body;
     
-    var senderEmail = getConfigValue(config, selectedAccountName + " Email", Session.getActiveUser().getEmail());
+    var senderEmail = getConfigValue(config, selectedAccountName + " Email", "");
     var senderLabel = getConfigValue(config, selectedAccountName + " Label", "");
     
     // 3. Handle recipient routing and dry-run safety
@@ -552,26 +594,10 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
       replyTo: senderEmail
     };
     
-    // 5. Send or Draft the email (In DRY_RUN mode, we ALWAYS create drafts)
+    // 5. Always route to "Ready to Send" tab for manual review, regardless of Outreach Mode
     var statusVal = "";
-    if (outreachMode.toLowerCase() === "send" && !DRY_RUN) {
-      var draft = GmailApp.createDraft(recipient, finalSubject, finalBody, options);
-      var msg = draft.send();
-      statusVal = "Email Sent";
-      recordAccountSend(selectedAccountName); // Feature 5: increment daily send counter
-      sheet.getRange(rowNumber, headersMap["Pipeline Stage"]).setValue("Sent");
-      if (headersMap["Last Sent At"]) {
-        sheet.getRange(rowNumber, headersMap["Last Sent At"]).setValue(new Date());
-      }
-      if (headersMap["Thread Id"]) {
-        sheet.getRange(rowNumber, headersMap["Thread Id"]).setValue(msg.getThread().getId());
-      }
-      if (headersMap["Sent From Account"]) {
-        sheet.getRange(rowNumber, headersMap["Sent From Account"]).setValue(selectedAccountName);
-      }
-    } else {
-      var readySheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Ready to Send");
-      if (readySheet) {
+    var readySheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Ready to Send");
+    if (readySheet) {
         var draftId = Utilities.getUuid();
         // Score the RAW draft body before any DRY_RUN / TEST prefix is applied,
         // so the quality score reflects actual email content.
@@ -579,7 +605,17 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
         var threshold = parseFloat(getConfigValue(config, "Draft Quality Threshold", "7"));
         var isReady = (!isNaN(qualityScore) && qualityScore >= threshold);
         
-        readySheet.appendRow([
+        var aVals = readySheet.getRange("A:A").getValues();
+        var insertRow = 1;
+        for (var i = 0; i < aVals.length; i++) {
+          if (aVals[i][0] === "") {
+            insertRow = i + 1;
+            break;
+          }
+        }
+        if (insertRow === 1) insertRow = aVals.length + 1;
+        
+        readySheet.getRange(insertRow, 1, 1, 15).setValues([[
           draftId,
           new Date(),
           getFieldValue(sheet, rowNumber, headersMap, mapping, "Company", "company"),
@@ -588,23 +624,27 @@ function processSingleOutreach(sheet, rowNumber, headersMap, config, outreachMod
           originalEmail,        // always store the real recipient, not the test-redirected one
           selectedAccountName,
           scoreRange,           // the lead score (value read earlier)
+          emailData.templateId || "1", // The Template ID used
           qualityScore,
+          "",                   // 2nd Time AI Score (blank initially)
+          "",                   // AI Verification Notes (blank initially)
           subject,              // raw subject (no TEST prefix)
           emailBody,            // raw body (no DRY_RUN wrapper)
           isReady
-        ]);
+        ]]);
         statusVal = "Draft in Ready Tab";
       } else {
-        GmailApp.createDraft(recipient, finalSubject, finalBody, options);
+        var apiRes = sendOrDraftViaAPI_(senderEmail, senderLabel, recipient, finalSubject, finalBody, true);
+        if (!apiRes.success) throw new Error("API Draft Failed: " + apiRes.error);
         statusVal = "Draft Created";
       }
       sheet.getRange(rowNumber, headersMap["Pipeline Stage"]).setValue("Draft Created");
-      if (headersMap["Sent From Account"]) {
-        sheet.getRange(rowNumber, headersMap["Sent From Account"]).setValue(selectedAccountName);
+      if (headersMap["Send From Account"]) {
+        sheet.getRange(rowNumber, headersMap["Send From Account"]).setValue(selectedAccountName);
       }
-    }
     
     // Lock 'Send From Account' and 'Email' cells so they can't be
+
     // accidentally changed after the email has been drafted/sent.
     if (headersMap["Send From Account"]) {
       sheet.getRange(rowNumber, headersMap["Send From Account"]).setValue(selectedAccountName);
@@ -675,33 +715,85 @@ function generatePersonalizedEmail(sheet, rowNumber, headersMap, config, selecte
       var rows = templatesSheet.getDataRange().getValues();
       var defaultStyleSubject = "";
       var defaultStyleBody = "";
+      var firstMatchPool = [];
+      var exactMatchPool = [];
+      var finalTemplateId = "";
       
-      for (var i = 0; i < rows.length; i++) {
+      for (var i = 1; i < rows.length; i++) {
         if (rows[i][0].toString().trim() === "Style Reference") {
-          var prefAccount = rows[i][3] ? rows[i][3].toString().trim() : "";
+          var prefAccount = rows[i][1] ? rows[i][1].toString().trim() : "";
           
-          if (!defaultStyleSubject) {
-            defaultStyleSubject = rows[i][1] || styleReferenceSubject;
-            defaultStyleBody = rows[i][2] || styleReferenceBody;
+          var rowTemplates = [];
+          var templateNum = 1;
+          for (var c = 2; c < rows[i].length; c += 2) {
+            if (rows[i][c] && rows[i][c+1]) {
+              rowTemplates.push({
+                subject: rows[i][c].toString(),
+                body: rows[i][c+1].toString(),
+                templateId: templateNum.toString()
+              });
+              templateNum++;
+            }
           }
           
-          if (prefAccount === selectedAccountName) {
-            styleReferenceSubject = rows[i][1] || styleReferenceSubject;
-            styleReferenceBody = rows[i][2] || styleReferenceBody;
-            break;
+          if (rowTemplates.length === 0) continue;
+          
+          if (firstMatchPool.length === 0) firstMatchPool = rowTemplates;
+          if (prefAccount === selectedAccountName || prefAccount === "") {
+            exactMatchPool = exactMatchPool.concat(rowTemplates);
           }
         }
       }
       
-      if (styleReferenceSubject === "Top talent hiring at {Company}" && defaultStyleSubject) {
+      var matchingTemplates = exactMatchPool.length > 0 ? exactMatchPool : firstMatchPool;
+      
+      if (matchingTemplates.length > 0) {
+        defaultStyleSubject = matchingTemplates[0].subject;
+        defaultStyleBody = matchingTemplates[0].body;
+        
+        var props = PropertiesService.getScriptProperties();
+        var propKey = "RECENT_TEMPLATES_" + selectedAccountName;
+        var recentStr = props.getProperty(propKey);
+        var recent = [];
+        if (recentStr) {
+          try { recent = JSON.parse(recentStr); } catch(e) {}
+        }
+        
+        var maxHistory = Math.max(0, matchingTemplates.length - 1);
+        
+        var available = matchingTemplates.filter(function(t) {
+          return recent.indexOf(t.subject) === -1;
+        });
+        
+        if (available.length === 0) {
+           available = matchingTemplates;
+           recent = [];
+        }
+        
+        var randomIdx = Math.floor(Math.random() * available.length);
+        var chosen = available[randomIdx];
+        
+        styleReferenceSubject = chosen.subject;
+        styleReferenceBody = chosen.body;
+        finalTemplateId = chosen.templateId || "";
+        
+        recent.push(chosen.subject);
+        if (recent.length > maxHistory) {
+           recent.shift();
+        }
+        props.setProperty(propKey, JSON.stringify(recent));
+        
+        Logger.log("Selected template variation " + finalTemplateId + " for " + selectedAccountName);
+      } else if (defaultStyleSubject) {
         styleReferenceSubject = defaultStyleSubject;
         styleReferenceBody = defaultStyleBody;
+        finalTemplateId = "1";
       }
     }
     
-    // 3. Formulate the LLM prompt for opener/closer generation
-    var prompt = "You are a professional B2B copywriter. We need to generate parts of a highly personalized, direct outreach email for a lead.\n\n" +
-    "Here is the style and tone reference email we are modeling. Match its tone, sentence rhythm, and formality — do not reuse its specific phrases:\n" +
+    // 3. Formulate the LLM prompt for full email personalization
+    var prompt = "You are a professional B2B copywriter. We need to generate a highly personalized, direct outreach email for a lead.\n\n" +
+    "Here is the style and tone reference email we are modeling. Match its tone, sentence rhythm, and formality, but you MUST rewrite it to personalize it for this lead:\n" +
     "```\n" +
     "Subject: " + styleReferenceSubject + "\n\n" +
     styleReferenceBody + "\n" +
@@ -716,28 +808,20 @@ function generatePersonalizedEmail(sheet, rowNumber, headersMap, config, selecte
     "- Total Funding: " + totalFunding + "\n" +
     "- Latest Funding: " + latestFunding + " (" + latestFundingAmount + ") raised in " + lastRaisedAt + "\n" +
     "- Web Search Context: " + webSearchContext + "\n\n" +
-    "Global rules (apply to opener AND closer):\n" +
-    "- Do not include specific figures, amounts, dates, employee counts, or numeric values. Reference signals qualitatively only (e.g. 'following your recent funding milestone' instead of 'raised $50M').\n" +
+    "Global rules:\n" +
+    "- Keep the EXACT same sender name, signature, and general structure as the reference email.\n" +
+    "- Do not include specific figures, amounts, dates, employee counts, or numeric values. Reference signals qualitatively only (e.g. 'following your recent funding milestone').\n" +
     "- Never fabricate facts. If information is thin, keep it safe and general.\n" +
     "- Tone: direct, concise, professional. No fluff, no exclamation marks.\n\n" +
     "Your Tasks:\n" +
-    "1. Generate an 'opener' (1-2 sentences). It must reference what the company actually does, specifically and accurately, based on the details or search context. Avoid generic flattery.\n" +
-    "2. Generate a 'closer' (1 sentence). It must act as a CTA and reference the qualifying signal (recent funding event or revenue growth stage) naturally. If both signals are present, prioritize the most recent funding event.\n" +
-    "3. Generate a 'sector' (1-2 words): a broad, general-audience category — NOT the literal Industry/Keywords text, rephrased or shortened. Abstract UP to the parent category a business audience would recognize.\n" +
-    "   Examples:\n" +
-    "   - Industry: 'Events services' -> Sector: 'Consumer Tech'\n" +
-    "   - Industry: 'K-12 exam prep SaaS platform' -> Sector: 'EdTech'\n" +
-    "   - Industry: 'Digital lending NBFC / neobank' -> Sector: 'Fintech'\n" +
-    "   - Industry: 'Solar EPC, renewable infra developer' -> Sector: 'Renewables'\n" +
-    "   - Industry: 'D2C personal care brand' -> Sector: 'Consumer'\n" +
-    "   The sector must read naturally in the sentence: 'leading <sector> platforms.'\n\n" +
-    "Do not output the entire email. Only output the requested JSON object.\n\n" +
+    "1. Replace {First Name} and {Company} with the actual details.\n" +
+    "2. Personalize the middle of the email to reference what the company actually does, specifically and accurately, based on the details or search context.\n" +
+    "3. Personalize the final CTA to reference the qualifying signal (recent funding event or revenue growth stage) naturally.\n\n" +
     "OUTPUT FORMAT:\n" +
-    "Respond ONLY with a JSON object in this format:\n" +
+    "Respond ONLY with a JSON object in this format (do not include markdown blocks or any other text):\n" +
     "{\n" +
-    "  \"opener\": \"<Your generated opener>\",\n" +
-    "  \"closer\": \"<Your generated closer>\",\n" +
-    "  \"sector\": \"<Your generated sector>\"\n" +
+    "  \"subject\": \"<Generated subject line>\",\n" +
+    "  \"body\": \"<Full generated email body with all paragraphs, using \\n\\n for line breaks>\"\n" +
     "}";
 
     var modelName = config.model || "gemini-2.0-flash";
@@ -746,25 +830,17 @@ function generatePersonalizedEmail(sheet, rowNumber, headersMap, config, selecte
     var cleanedJson = cleanJsonResponseText(responseText);
     var result = JSON.parse(cleanedJson);
 
-    if (!result.opener || !result.closer || !result.sector) {
-      throw new Error("AI response missing opener or closer or sector. Got: " + responseText);
+    if (!result.body || !result.subject) {
+      throw new Error("AI response missing body or subject. Got: " + responseText);
     }
 
-    // 4. Assemble the email body
-    var subject = "Top talent hiring at " + company;
-    var body = "Hi " + (firstName || "there") + ",\n\n" +
-               "I'm Ayush from Butter Search - an executive recruitment firm founded by IIM Calcutta alumni (ex-Naukri, Alvarez & Marsal).\n\n" +
-               result.opener.trim() + "\n\n" +
-               "That's where we come in - getting top talent connected with leading " + result.sector.trim() + " platforms, working directly with founders, CXOs and business leaders.\n\n" +
-               result.closer.trim() + "\n\n" +
-               signature;
-               
-    var containsNumbers = /[\d₹\$%]/i.test(result.opener) || /[\d₹\$%]/i.test(result.closer);
+    var containsNumbers = /[\d₹\$%]/i.test(result.body);
                
     return {
       success: true,
-      subject: subject,
-      body: body,
+      subject: result.subject,
+      body: result.body,
+      templateId: finalTemplateId,
       flagged: containsNumbers
     };
     
@@ -852,61 +928,128 @@ function sendDraftsFromPipeline() {
   var headersMap = getHeadersMap(leadsSheet);
   var lastRow = leadsSheet.getLastRow();
   
-  ui.alert("Sending...", "Please wait while the system finds and sends your drafts. This may take a minute.", ui.ButtonSet.OK);
+  var startRow = 2;
+  var endRow = lastRow;
+  var activeRange = leadsSheet.getActiveRange();
   
-  // Get all drafts in Gmail once to avoid calling getDrafts() in a loop
-  var allDrafts = GmailApp.getDrafts();
+  if (activeRange) {
+    var rStart = activeRange.getRow();
+    var rEnd = rStart + activeRange.getNumRows() - 1;
+    if (rStart > 1) {
+      startRow = rStart;
+      endRow = Math.min(rEnd, lastRow);
+    }
+  }
+  
+  ui.alert("Sending Selected...", "Please wait while the system checks your selected rows for drafts to send.", ui.ButtonSet.OK);
+  
   var sentCount = 0;
   var notFoundCount = 0;
+  var skippedQuotaCount = 0;
+  var config = getConfig();
   
-  for (var r = 2; r <= lastRow; r++) {
+  for (var r = startRow; r <= endRow; r++) {
     var status = leadsSheet.getRange(r, headersMap["Outreach Status"]).getValue().toString().trim();
     if (status === "Draft Created" || status === "Draft Created (Dry Run)") {
       var email = leadsSheet.getRange(r, headersMap["Email"]).getValue().toString().trim();
-      var foundDraft = false;
+      var accountName = headersMap["Send From Account"] ? leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim() : "";
+      if (!accountName) accountName = "Account A"; // Fallback if empty
+      var threadIdColVal = headersMap["Thread Id"] ? leadsSheet.getRange(r, headersMap["Thread Id"]).getValue().toString().trim() : "";
       
-      // Look for a draft addressed to this email OR containing the original recipient tag
-      for (var d = 0; d < allDrafts.length; d++) {
-        var draft = allDrafts[d];
-        var msg = draft.getMessage();
-        var draftTo = msg.getTo() || "";
-        var draftBody = msg.getBody() || "";
-        var draftPlain = msg.getPlainBody() || "";
-        
-        var isMatch = false;
-        if (draftTo.toLowerCase().indexOf(email.toLowerCase()) !== -1) {
-          isMatch = true;
-        } else if (draftBody.indexOf(email) !== -1 || draftPlain.indexOf(email) !== -1) {
-          // Fallback for Test Drafts where the email is in the "Original Recipient: ..." header
-          isMatch = true;
-        }
-        
-        if (isMatch) {
-          draft.send();
-          foundDraft = true;
-          
-          // Update sheet
-          leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Email Sent");
-          leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue("Sent");
-          leadsSheet.getRange(r, headersMap["Last Sent At"]).setValue(new Date());
-          sentCount++;
-          
-          // Remove from our array so we don't process it again
-          allDrafts.splice(d, 1);
-          break;
-        }
+      var senderEmail = getConfigValue(config, accountName + " Email", "").toString().trim();
+      var draftId = "";
+      
+      // We expect the Thread Id column to store 'DRAFT:<id>' for unsent drafts
+      if (threadIdColVal.indexOf("DRAFT:") === 0) {
+        draftId = threadIdColVal.substring(6);
       }
       
-      if (!foundDraft) {
+      if (draftId && senderEmail) {
+        // ── QUOTA GATE: check remaining allowance for this account ──────────────
+        var remaining = getRemainingQuota(accountName);
+        if (remaining <= 0) {
+          Logger.log("sendDraftsFromPipeline: quota exhausted for " + accountName + ", skipping row " + r);
+          skippedQuotaCount++;
+          continue;
+        }
+        
+        var sendRes = sendDraftByIdViaAPI_(senderEmail, draftId);
+        
+        if (sendRes.success) {
+          sentCount++;
+          
+          // ── HOURLY RATE LIMIT: check before confirming send ──────────────────
+          try {
+            var hourlyCheck = checkHourlyLimit(accountName, "fresh");
+            if (!hourlyCheck.ok) {
+              SpreadsheetApp.getUi().alert("Hourly Limit Reached", hourlyCheck.message, SpreadsheetApp.getUi().ButtonSet.OK);
+              Logger.log("sendDraftsFromPipeline: hourly limit hit for " + accountName + ". Stopping.");
+              break;
+            }
+          } catch(he) { Logger.log("Hourly check error: " + he); }
+
+          // ── QUOTA TRACKING: record the send against this account ────────────
+          try { recordSend(accountName); } catch(qe) {
+            Logger.log("sendDraftsFromPipeline: recordSend failed for " + accountName + ": " + qe);
+          }
+          try { recordHourlySend(accountName, "fresh"); } catch(he) {}
+          
+          // Update sheet — status, pipeline stage, sent-at timestamp
+          leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Email Sent");
+          leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue("Sent");
+          
+          var now = new Date();
+          leadsSheet.getRange(r, headersMap["Last Sent At"]).setValue(now);
+          if (headersMap["Send Date"]) {
+            leadsSheet.getRange(r, headersMap["Send Date"]).setValue(now);
+          }
+          
+          // CRITICAL: write real Thread Id so Scan Inbox can track this lead
+          var actualThreadId = "";
+          if (headersMap["Thread Id"] && sendRes.threadId) {
+            actualThreadId = sendRes.threadId;
+            try { leadsSheet.getRange(r, headersMap["Thread Id"]).setValue(actualThreadId); } catch(te) {}
+          }
+          
+          // Ensure Send From Account is stamped
+          if (headersMap["Send From Account"]) {
+            var existingAcc = leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim();
+            if (!existingAcc) leadsSheet.getRange(r, headersMap["Send From Account"]).setValue(accountName);
+          }
+          
+          try { logDailySend("Fresh", accountName, email, "(Sent via Pipeline Draft)", actualThreadId); } catch(e) {}
+          
+          // HISTORICAL METRICS: Log the fresh send
+          if (typeof logMetricEvent === "function" && actualThreadId) {
+            try { logMetricEvent(accountName, "Fresh_Sent", actualThreadId, email, now); } catch(me) {
+              Logger.log("sendDraftsFromPipeline: metrics logging failed: " + me);
+            }
+          }
+          
+          // Auto-schedule follow-up sequence
+          if (typeof scheduleFollowups === "function") {
+            try { scheduleFollowups({ row: r }); } catch(se) {}
+          }
+        } else {
+          Logger.log("Failed to send draft " + draftId + " for row " + r + ": " + sendRes.error);
+          notFoundCount++;
+        }
+      } else {
         notFoundCount++;
       }
     }
   }
   
   var msg = "Sent " + sentCount + " drafts successfully!";
-  if (notFoundCount > 0) {
-    msg += "\nCould not find Gmail drafts for " + notFoundCount + " leads (they may have been deleted, altered, or sent manually).";
+  if (skippedQuotaCount > 0) {
+    msg += "\n⚠️ " + skippedQuotaCount + " draft(s) were skipped because the daily quota for their account is exhausted. They will remain as drafts until tomorrow.";
   }
+  if (notFoundCount > 0) {
+    msg += "\nCould not find Gmail API draft IDs for " + notFoundCount + " leads. They may have been created before this update, or sent manually.";
+  }
+  
+  if (typeof updateDailyForecast === "function") updateDailyForecast();
+  
   ui.alert("Sending Complete", msg, ui.ButtonSet.OK);
 }
 
@@ -971,7 +1114,7 @@ function detectRepliesAndFollowUpInternal(isHeadless) {
   }
   
   var lastRow = leadsSheet.getLastRow();
-  var myEmail = Session.getActiveUser().getEmail();
+  var myEmail = ""; // Fallback not used when multi-mailbox is configured properly
   var delayDays = parseInt(getConfigValue(config, "Follow-up Delay (Days)", "3")) || 3;
   var outreachMode = getConfigValue(config, "Outreach Mode", "Draft");
   var testRecipient = getConfigValue(config, "Test Email Recipient", "").toString().trim();
@@ -1086,9 +1229,9 @@ function detectRepliesAndFollowUpInternal(isHeadless) {
       
       if (diffDays >= delayDays) {
         // Sender Identity
-        var sentFromAccount = headersMap["Sent From Account"] ? leadsSheet.getRange(r, headersMap["Sent From Account"]).getValue().toString().trim() : "";
+        var sentFromAccount = headersMap["Send From Account"] ? leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim() : "";
         var selectedAccountName = sentFromAccount || getConfigValue(config, "Default Send Account", "Account A").toString().trim();
-        var senderEmail = getConfigValue(config, selectedAccountName + " Email", Session.getActiveUser().getEmail());
+        var senderEmail = getConfigValue(config, selectedAccountName + " Email", "");
         var senderLabel = getConfigValue(config, selectedAccountName + " Label", "");
         
         // Select correct template
@@ -1180,10 +1323,10 @@ function buildFollowUpForRow(leadsSheet, r, headersMap, config, followUpTemplate
   if (!emailWasSent) return { success: false, reason: "Email not yet sent (Stage: " + pipelineStage + ")" };
   if (repliedStatus === "Yes") return { success: false, reason: "Lead already replied" };
 
-  // Sender identity — priority: forced (popup) > Sent From Account column > Default
-  var sentFromAccount     = headersMap["Sent From Account"] ? leadsSheet.getRange(r, headersMap["Sent From Account"]).getValue().toString().trim() : "";
+  // Sender identity — priority: forced (popup) > Send From Account column > Default
+  var sentFromAccount     = headersMap["Send From Account"] ? leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim() : "";
   var selectedAccountName = forcedAccount || sentFromAccount || getConfigValue(config, "Default Send Account", "Account A").toString().trim();
-  var senderEmail         = getConfigValue(config, selectedAccountName + " Email", Session.getActiveUser().getEmail());
+  var senderEmail         = getConfigValue(config, selectedAccountName + " Email", "");
   var senderLabel         = getConfigValue(config, selectedAccountName + " Label", "");
   var senderFirstName     = senderLabel ? senderLabel.split(" ")[0] : "Ayush";
   var signature           = getConfigValue(config, selectedAccountName + " Signature", "Best,\n" + senderFirstName + "\nButter Search");
@@ -1613,48 +1756,94 @@ function clearFollowUpTriggerInternal() {
 }
 
 /**
- * Set up the hourly trigger for automated outreach.
+ * Set up the 1-minute trigger for the Drip Engine.
  */
-function setupOutreachTrigger() {
+function setupDripEngineTrigger() {
   var ui = SpreadsheetApp.getUi();
-  clearOutreachTriggerInternal();
+  clearDripEngineTriggerInternal();
   setConfigValue("Sending Active", true);
   
-  ScriptApp.newTrigger("runOutreachPipelineHourly")
+  ScriptApp.newTrigger("runDripEngine")
     .timeBased()
-    .everyHours(1)
+    .everyMinutes(1)
     .create();
     
-  ui.alert("Trigger Activated", "Hourly outreach trigger has been set up successfully. 'Sending Active' is now true. The system will automatically send/draft up to the batch limit every hour.", ui.ButtonSet.OK);
+  ui.alert("Drip Engine Activated", "The Drip Engine has been set up successfully. 'Sending Active' is now true. It will check every minute and send 1 email only if the Drip Gap has passed.", ui.ButtonSet.OK);
 }
 
 /**
- * Deactivate the hourly trigger for automated outreach.
+ * Deactivate the Drip Engine trigger.
  */
-function deactivateOutreachTrigger() {
+function deactivateDripEngineTrigger() {
   var ui = SpreadsheetApp.getUi();
-  clearOutreachTriggerInternal();
+  clearDripEngineTriggerInternal();
   setConfigValue("Sending Active", false);
-  ui.alert("Trigger Deactivated", "Hourly outreach trigger has been deactivated. 'Sending Active' is now false.", ui.ButtonSet.OK);
+  ui.alert("Drip Engine Deactivated", "The Drip Engine trigger has been deactivated. 'Sending Active' is now false.", ui.ButtonSet.OK);
 }
 
 /**
- * Helper to clear all existing outreach triggers.
+ * Helper to clear all existing Drip Engine triggers.
  */
-function clearOutreachTriggerInternal() {
+function clearDripEngineTriggerInternal() {
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === "runOutreachPipelineHourly") {
+    if (triggers[i].getHandlerFunction() === "runDripEngine" || triggers[i].getHandlerFunction() === "runOutreachPipelineHourly") {
       ScriptApp.deleteTrigger(triggers[i]);
     }
   }
 }
 
 /**
- * Headless entry point for the hourly trigger.
+ * Headless entry point for the Drip Engine (runs every 1 minute).
  */
-function runOutreachPipelineHourly() {
-  processOutreachInternal(true, false, false);
+function runDripEngine() {
+  try {
+    var config = getConfig();
+    var gapMinutes = parseInt(getConfigValue(config, "Drip Gap (Minutes)", "5")) || 5;
+    
+    var lastDripStr = PropertiesService.getScriptProperties().getProperty("LAST_DRIP_TIME");
+    var now = new Date();
+    
+    if (lastDripStr) {
+      var lastDrip = new Date(parseInt(lastDripStr));
+      var diffMinutes = (now.getTime() - lastDrip.getTime()) / 60000;
+      if (diffMinutes < gapMinutes) {
+        Logger.log("Drip Engine: " + gapMinutes + " minutes haven't passed yet. Skipping execution.");
+        return;
+      }
+    }
+    
+    Logger.log("Drip Engine: Executing. Priority 1: Follow-ups. Priority 2: Ready Drafts. Priority 3: Pipeline Drafts.");
+    
+    // Priority 1: Try sending ONE due follow-up
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (typeof sendOneDueFollowup === "function") {
+      if (sendOneDueFollowup(config)) {
+        PropertiesService.getScriptProperties().setProperty("LAST_DRIP_TIME", now.getTime().toString());
+        if (typeof updateDailyForecast === "function") updateDailyForecast();
+        return;
+      }
+    }
+    
+    // Priority 2: Try sending ONE approved draft from 'Ready to Send'
+    if (sendOneReadyDraft_(config, ss)) {
+      PropertiesService.getScriptProperties().setProperty("LAST_DRIP_TIME", now.getTime().toString());
+      if (typeof updateDailyForecast === "function") updateDailyForecast();
+      return;
+    }
+    
+    // Priority 3: Try sending ONE pending draft from the Pipeline (Draft Created)
+    if (sendOnePipelineDraft_(config, ss)) {
+      PropertiesService.getScriptProperties().setProperty("LAST_DRIP_TIME", now.getTime().toString());
+      if (typeof updateDailyForecast === "function") updateDailyForecast();
+      return;
+    }
+    
+    Logger.log("Drip Engine: Nothing to send right now.");
+    
+  } catch (e) {
+    Logger.log("runDripEngine Error: " + e.toString());
+  }
 }
 
 /**
@@ -1782,40 +1971,16 @@ function callFailoverModelForOutreach(modelName, prompt, config) {
  * Feature 8: Score the draft quality 1-10 using the secondary Gemini API Key if available.
  */
 function scoreDraftQuality(draftBody, config) {
-  var apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
-  if (!apiKey) return 0; // Fallback if no key
-  
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + apiKey;
   var prompt = "You are a QA editor for outbound sales emails. Rate the following draft email on a scale of 1-10, where 10 is highly personalized, professional, and free of weird placeholders or AI hallucinations. 1 is robotic, contains placeholders like [Company Name], or uses weird formatting.\n\n" +
                "Draft Email:\n" + draftBody + "\n\n" +
                "Reply with ONLY a number from 1 to 10.";
-  
-  var payload = {
-    "contents": [{ "parts": [{ "text": prompt }] }],
-    "generationConfig": {
-      "temperature": 0.0,
-      "maxOutputTokens": 5
-    }
-  };
-  
-  var options = {
-    "method": "post",
-    "headers": { "Content-Type": "application/json" },
-    "payload": JSON.stringify(payload),
-    "muteHttpExceptions": true
-  };
-  
+               
+  var modelName = getConfigValue(config, "Gemini Model", "gemini-2.0-flash").toString().trim();
   try {
-    var response = UrlFetchApp.fetch(url, options);
-    if (response.getResponseCode() === 200) {
-      var json = JSON.parse(response.getContentText());
-      if (json.candidates && json.candidates[0] && json.candidates[0].content) {
-        var text = json.candidates[0].content.parts[0].text;
-        var numMatch = text.match(/\d+/);
-        if (numMatch) {
-          return parseInt(numMatch[0], 10);
-        }
-      }
+    var response = callFailoverModelForOutreach(modelName, prompt, config);
+    var numMatch = response.match(/\d+/);
+    if (numMatch) {
+      return parseInt(numMatch[0], 10);
     }
   } catch(e) {
     Logger.log("Draft quality scoring error: " + e.toString());
@@ -1823,6 +1988,20 @@ function scoreDraftQuality(draftBody, config) {
   
   return 0; // default failure
 }
+function pushReadyDraftsMenu() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var config = getConfig();
+  var batchLimit = parseInt(getConfigValue(config, "Emails Per Run", "10")) || 10;
+  var testRecipient = getConfigValue(config, "Test Email Recipient", "").toString().trim();
+  var outreachMode = getConfigValue(config, "Outreach Mode", "Draft").toString().trim();
+  
+  processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMode);
+  
+  if (typeof updateDailyForecast === "function") updateDailyForecast();
+  
+  SpreadsheetApp.getUi().alert("Success", "Finished pushing approved drafts to Gmail.", SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
 /**
  * Feature 8: Hourly sender pulling from the Ready to Send tab instead of the Leads tab.
  */
@@ -1873,38 +2052,61 @@ function processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMo
         continue;
       }
       
-      var senderEmail = getConfigValue(config, selectedAccountName + " Email", Session.getActiveUser().getEmail());
+      var senderEmail = getConfigValue(config, selectedAccountName + " Email", "");
       var senderLabel = getConfigValue(config, selectedAccountName + " Label", "");
+      var senderSignature = getConfigValue(config, selectedAccountName + " Signature", "");
       
       var originalEmail = recipient;
+      var stagingMode = getConfigValue(config, "Staging Mode", "false").toString().trim().toLowerCase() === "true";
+      
       if (DRY_RUN) {
         recipient = testRecipient || originalEmail;
         finalSubject = "[TEST DRAFT] " + finalSubject;
         finalBody = "=== DRY RUN (Original Recipient: " + originalEmail + ") ===\n\n" + finalBody;
       } else if (testRecipient) {
         recipient = testRecipient;
-        finalSubject = "[TEST] " + finalSubject;
-        finalBody = "=== TEST RUN (Original Recipient: " + originalEmail + ") ===\n\n" + finalBody;
+        if (!stagingMode) {
+          finalSubject = "[TEST] " + finalSubject;
+          finalBody = "=== TEST RUN (Original Recipient: " + originalEmail + ") ===\n\n" + finalBody;
+        }
+      }
+      
+      var finalBodyWithSig = finalBody;
+      if (senderSignature) {
+        finalBodyWithSig += "\n\n" + senderSignature;
       }
       
       var options = {
-        htmlBody: finalBody.replace(/\n/g, "<br>"),
+        htmlBody: finalBodyWithSig.replace(/\n/g, "<br>"),
         from: senderEmail,
         name: senderLabel,
         replyTo: senderEmail
       };
       
       try {
-        if (outreachMode.toLowerCase() === "send" && !DRY_RUN) {
-          GmailApp.createDraft(recipient, finalSubject, finalBody, options).send();
-          recordAccountSend(selectedAccountName); // Feature 5: increment daily cap counter
-        } else {
-          GmailApp.createDraft(recipient, finalSubject, finalBody, options);
+        var isDraft = (outreachMode.toLowerCase() !== "send" || DRY_RUN);
+        
+        // Quota check before sending directly
+        if (!isDraft) {
+          var remaining = getRemainingQuota(selectedAccountName);
+          if (remaining <= 0) {
+            Logger.log("Skipping Ready tab row " + r + ": Quota exhausted for " + selectedAccountName);
+            continue;
+          }
+        }
+        
+        var apiRes = sendOrDraftViaAPI_(senderEmail, senderLabel, recipient, finalSubject, options.htmlBody, isDraft);
+        if (!apiRes.success) {
+          throw new Error("Gmail API Error: " + apiRes.error);
+        }
+        
+        if (!isDraft) {
+          try { recordSend(selectedAccountName); } catch(qe) {}
         }
         successCount++;
         processed++;
         
-        // Update the main Leads sheet so Pipeline Stage reflects the send
+        // Update the main Leads sheet so Pipeline Stage reflects the send or draft
         if (leadsSheet && leadsHeadersMap) {
           var leadsLastRow = leadsSheet.getLastRow();
           if (leadsLastRow > 1 && leadsHeadersMap["Email"]) {
@@ -1913,15 +2115,35 @@ function processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMo
             for (var li = 0; li < emailVals.length; li++) {
               if (emailVals[li][0].toString().trim().toLowerCase() === originalEmail.toLowerCase()) {
                 var leadsRow = li + 2;
-                if (leadsHeadersMap["Pipeline Stage"]) {
-                  leadsSheet.getRange(leadsRow, leadsHeadersMap["Pipeline Stage"]).setValue("Sent");
+                if (isDraft) {
+                  if (leadsHeadersMap["Pipeline Stage"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Pipeline Stage"]).setValue("Draft Created");
+                  if (leadsHeadersMap["Outreach Status"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Outreach Status"]).setValue(DRY_RUN ? "Draft Created (Dry Run)" : "Draft Created");
+                  if (leadsHeadersMap["Thread Id"] && apiRes.draftId) {
+                    try { leadsSheet.getRange(leadsRow, leadsHeadersMap["Thread Id"]).setValue("DRAFT:" + apiRes.draftId); } catch(te) {}
+                  }
+                } else {
+                  if (leadsHeadersMap["Pipeline Stage"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Pipeline Stage"]).setValue("Sent");
+                  if (leadsHeadersMap["Last Sent At"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Last Sent At"]).setValue(new Date());
+                  if (leadsHeadersMap["Outreach Status"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Outreach Status"]).setValue("Email Sent");
+                  // CRITICAL: write Thread Id so Scan Inbox can track this lead
+                  if (leadsHeadersMap["Thread Id"] && apiRes.threadId) {
+                    try { leadsSheet.getRange(leadsRow, leadsHeadersMap["Thread Id"]).setValue(apiRes.threadId); } catch(te) {}
+                  }
+                  // Auto-schedule follow-up sequence: FU1 = 3 days from now, FU2 = 10 days after FU1.
+                  // Also sets Follow-up Status = "Pending" automatically.
+                  if (typeof scheduleFollowups === "function") {
+                    try { scheduleFollowups({ row: leadsRow }); } catch(se) {
+                      Logger.log("processReadyTabHourly: scheduleFollowups failed for leadsRow " + leadsRow + ": " + se);
+                    }
+                  }
                 }
-                if (leadsHeadersMap["Last Sent At"]) {
-                  leadsSheet.getRange(leadsRow, leadsHeadersMap["Last Sent At"]).setValue(new Date());
+                
+                // Stamp the account name (whether draft or send)
+                if (leadsHeadersMap["Send From Account"]) {
+                  var existingAcc2 = leadsSheet.getRange(leadsRow, leadsHeadersMap["Send From Account"]).getValue().toString().trim();
+                  if (!existingAcc2) leadsSheet.getRange(leadsRow, leadsHeadersMap["Send From Account"]).setValue(selectedAccountName);
                 }
-                if (leadsHeadersMap["Outreach Status"]) {
-                  leadsSheet.getRange(leadsRow, leadsHeadersMap["Outreach Status"]).setValue("Email Sent");
-                }
+
                 break;
               }
             }
@@ -1947,4 +2169,192 @@ function processReadyTabHourly(config, ss, batchLimit, testRecipient, outreachMo
   }
   
   Logger.log("Outreach Complete (Ready Tab). Checked: " + processed + ", Success: " + successCount);
+}
+
+/**
+ * Sends exactly ONE approved draft from the 'Ready to Send' tab.
+ * Used exclusively by the Drip Engine.
+ */
+function sendOneReadyDraft_(config, ss) {
+  var readySheet = ss.getSheetByName("Ready to Send");
+  var leadsSheet = ss.getSheetByName("Leads");
+  if (!readySheet || !leadsSheet) return false;
+  
+  var lastRow = readySheet.getLastRow();
+  if (lastRow <= 1) return false;
+  
+  var headers = readySheet.getRange(1, 1, 1, readySheet.getLastColumn()).getValues()[0];
+  var readyForSendIdx = headers.indexOf("Ready for Send");
+  var emailIdx = headers.indexOf("Email");
+  var accountIdx = headers.indexOf("Selected Account");
+  var subjectIdx = headers.indexOf("Subject");
+  var bodyIdx = headers.indexOf("Body");
+  
+  if (readyForSendIdx === -1 || emailIdx === -1 || accountIdx === -1) return false;
+  
+  var dataRange = readySheet.getRange(2, 1, lastRow - 1, readySheet.getLastColumn());
+  var data = dataRange.getValues();
+  
+  var leadsHeadersMap = getHeadersMap(leadsSheet);
+  
+  for (var i = 0; i < data.length; i++) {
+    var isReady = data[i][readyForSendIdx];
+    if (isReady === true || isReady.toString().toLowerCase() === "true") {
+      
+      var r = i + 2;
+      var recipient = data[i][emailIdx].toString().trim();
+      var selectedAccountName = data[i][accountIdx].toString().trim();
+      var finalSubject = data[i][subjectIdx].toString().trim();
+      var finalBody = data[i][bodyIdx].toString().trim();
+      
+      if (!recipient || !selectedAccountName) continue;
+      
+      var senderEmail = getConfigValue(config, selectedAccountName + " Email", "").toString().trim();
+      var senderLabel = getConfigValue(config, selectedAccountName + " Label", "").toString().trim();
+      var senderSignature = getConfigValue(config, selectedAccountName + " Signature", "").toString().trim();
+      
+      var finalBodyWithSig = finalBody;
+      if (senderSignature) {
+        finalBodyWithSig += "\n\n" + senderSignature;
+      }
+      
+      var options = {
+        htmlBody: finalBodyWithSig.replace(/\n/g, "<br>"),
+        from: senderEmail,
+        name: senderLabel,
+        replyTo: senderEmail
+      };
+      
+      // Check Hourly Quota
+      var hourlyCheck = checkHourlyLimit(selectedAccountName, "fresh");
+      if (!hourlyCheck.ok) {
+        Logger.log("sendOneReadyDraft: Hourly limit hit for " + selectedAccountName + ". Skipping.");
+        continue;
+      }
+      
+      // Check Daily Quota
+      var remaining = getRemainingQuota(selectedAccountName);
+      if (remaining <= 0) {
+        Logger.log("sendOneReadyDraft: Daily quota exhausted for " + selectedAccountName + ". Skipping.");
+        continue;
+      }
+      
+      var apiRes = sendOrDraftViaAPI_(senderEmail, senderLabel, recipient, finalSubject, options.htmlBody, false);
+      if (!apiRes.success) {
+        Logger.log("sendOneReadyDraft API Error: " + apiRes.error);
+        continue;
+      }
+      
+      try { recordSend(selectedAccountName); } catch(qe) {}
+      try { recordHourlySend(selectedAccountName, "fresh"); } catch(he) {}
+      
+      // Update Leads sheet
+      var leadsLastRow = leadsSheet.getLastRow();
+      if (leadsLastRow > 1 && leadsHeadersMap["Email"]) {
+        var emailCol = leadsHeadersMap["Email"];
+        var emailVals = leadsSheet.getRange(2, emailCol, leadsLastRow - 1, 1).getValues();
+        for (var li = 0; li < emailVals.length; li++) {
+          if (emailVals[li][0].toString().trim().toLowerCase() === recipient.toLowerCase()) {
+            var leadsRow = li + 2;
+            if (leadsHeadersMap["Pipeline Stage"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Pipeline Stage"]).setValue("Sent");
+            if (leadsHeadersMap["Last Sent At"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Last Sent At"]).setValue(new Date());
+            if (leadsHeadersMap["Outreach Status"]) leadsSheet.getRange(leadsRow, leadsHeadersMap["Outreach Status"]).setValue("Email Sent");
+            if (leadsHeadersMap["Send From Account"]) {
+              var existingAcc2 = leadsSheet.getRange(leadsRow, leadsHeadersMap["Send From Account"]).getValue().toString().trim();
+              if (!existingAcc2) leadsSheet.getRange(leadsRow, leadsHeadersMap["Send From Account"]).setValue(selectedAccountName);
+            }
+            if (leadsHeadersMap["Thread Id"] && apiRes.threadId) {
+              try { leadsSheet.getRange(leadsRow, leadsHeadersMap["Thread Id"]).setValue(apiRes.threadId); } catch(te) {}
+            }
+            if (typeof scheduleFollowups === "function") {
+              try { scheduleFollowups({ row: leadsRow }); } catch(se) {}
+            }
+            break;
+          }
+        }
+      }
+      
+      try { logDailySend("Fresh", selectedAccountName, recipient, finalSubject, apiRes.threadId || ""); } catch(e) {}
+      
+      readySheet.deleteRow(r);
+      Logger.log("Drip Engine: Sent Ready Draft to " + recipient);
+      return true; // Sent one!
+    }
+  }
+  return false;
+}
+
+/**
+ * Sends exactly ONE pending draft from the Leads pipeline.
+ * Used exclusively by the Drip Engine.
+ */
+function sendOnePipelineDraft_(config, ss) {
+  var leadsSheet = ss.getSheetByName("Leads");
+  if (!leadsSheet) return false;
+  
+  var headersMap = getHeadersMap(leadsSheet);
+  var lastRow = leadsSheet.getLastRow();
+  if (lastRow <= 1) return false;
+  
+  for (var r = 2; r <= lastRow; r++) {
+    var status = leadsSheet.getRange(r, headersMap["Outreach Status"]).getValue().toString().trim();
+    if (status === "Draft Created" || status === "Draft Created (Dry Run)") {
+      var email = leadsSheet.getRange(r, headersMap["Email"]).getValue().toString().trim();
+      var accountName = headersMap["Send From Account"] ? leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim() : "";
+      if (!accountName) accountName = "Account A";
+      
+      var threadIdColVal = headersMap["Thread Id"] ? leadsSheet.getRange(r, headersMap["Thread Id"]).getValue().toString().trim() : "";
+      var senderEmail = getConfigValue(config, accountName + " Email", "").toString().trim();
+      var draftId = "";
+      
+      if (threadIdColVal.indexOf("DRAFT:") === 0) {
+        draftId = threadIdColVal.substring(6);
+      }
+      
+      if (draftId && senderEmail) {
+        // Quota check
+        var remaining = getRemainingQuota(accountName);
+        if (remaining <= 0) continue;
+        
+        // Hourly check
+        var hourlyCheck = checkHourlyLimit(accountName, "fresh");
+        if (!hourlyCheck.ok) continue;
+        
+        var sendRes = sendDraftByIdViaAPI_(senderEmail, draftId);
+        
+        if (sendRes.success) {
+          try { recordSend(accountName); } catch(qe) {}
+          try { recordHourlySend(accountName, "fresh"); } catch(he) {}
+          
+          leadsSheet.getRange(r, headersMap["Outreach Status"]).setValue("Email Sent");
+          leadsSheet.getRange(r, headersMap["Pipeline Stage"]).setValue("Sent");
+          
+          var now = new Date();
+          leadsSheet.getRange(r, headersMap["Last Sent At"]).setValue(now);
+          if (headersMap["Send Date"]) leadsSheet.getRange(r, headersMap["Send Date"]).setValue(now);
+          
+          var actualThreadId = "";
+          if (headersMap["Thread Id"] && sendRes.threadId) {
+            actualThreadId = sendRes.threadId;
+            try { leadsSheet.getRange(r, headersMap["Thread Id"]).setValue(actualThreadId); } catch(te) {}
+          }
+          
+          if (headersMap["Send From Account"]) {
+            var existingAcc = leadsSheet.getRange(r, headersMap["Send From Account"]).getValue().toString().trim();
+            if (!existingAcc) leadsSheet.getRange(r, headersMap["Send From Account"]).setValue(accountName);
+          }
+          
+          try { logDailySend("Fresh", accountName, email, "(Sent via Pipeline Draft)", actualThreadId); } catch(e) {}
+          
+          if (typeof scheduleFollowups === "function") {
+            try { scheduleFollowups({ row: r }); } catch(se) {}
+          }
+          
+          Logger.log("Drip Engine: Sent Pipeline Draft to " + email);
+          return true; // Sent one!
+        }
+      }
+    }
+  }
+  return false;
 }
